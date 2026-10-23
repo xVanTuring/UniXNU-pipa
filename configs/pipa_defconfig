@@ -3,7 +3,7 @@
 # for the kernel build.
 #
 # Left out until their board or image inputs exist: NATIVE_UFS (SM8550 registers), the owner root chain
-# (VERIFIED_ROOT_PROBE, OWNER_*; it needs owner-signed volume policies), BOOT_PROGRESS (it requires that chain),
+# (VERIFIED_ROOT_PROBE, OWNER_*; it needs owner-signed volume policies),
 # NATIVE_LEGACY_DISPLAY (its archive carries the sheng board probes), NATIVE_RAM_BLOCK and SOURCE_MOCKFS (no Data or
 # fixture root yet) and NATIVE_ADRENO. SHENG_PMGR links the original-PMGR bridge (scripts/build-platform-power.py),
 # without which the original AMFI panics with "No PMGR". On the QEMU board the same kernel draws nothing through XNU's
@@ -20,6 +20,11 @@ CONFIG_XNU_DT_PANIC_REGION=y
 CONFIG_XNU_NATIVE_ARCH_TIMER=y
 CONFIG_XNU_NATIVE_PAN=y
 CONFIG_XNU_SHENG_PMGR=y
+# The boot progress hooks, implemented by the board's ramoops kernel log (package/BootRamoops.c, scripts/build-boot-progress.py)
+# instead of sheng's progress page, which needs the owner root chain: stages, process events and the message buffer go into the
+# stock ramoops console zone. STANDALONE: none of the progress page's inputs (UFS, owner root audit, Virtio) are required.
+CONFIG_XNU_BOOT_PROGRESS=y
+CONFIG_XNU_BOOT_PROGRESS_STANDALONE=y
 
 CONFIG_XNU_CRYPTO_BOOTSTRAP="prelinked"
 # No-op hooks for probes of the left-out components (scripts/build-link-stubs.py).
