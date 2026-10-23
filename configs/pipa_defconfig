@@ -2,7 +2,8 @@
 # pthread providers, NativeAES, the SM8250 UFS root and the owner root chain of UniXNU-tb128fu. CONFIG_XNU_<NAME> becomes
 # XNU_<NAME> for the kernel build.
 #
-# Left out until their board inputs exist: NATIVE_LEGACY_DISPLAY (the display stack, next) and NATIVE_ADRENO.
+# The display stack of UniXNU-tb128fu without its GPU: NATIVE_LEGACY_DISPLAY (the firmware frame buffer, QuartzCore's CPU
+# renderer). Left out until its inputs exist: NATIVE_ADRENO (Adreno 650).
 # SHENG_PMGR links the original-PMGR bridge (scripts/build-platform-power.py),
 # without which the original AMFI panics with "No PMGR". On the QEMU board the same kernel draws nothing through XNU's
 # video console despite -v: after the entry probe bars, the panic screen is the only kernel output on the frame buffer.
@@ -54,4 +55,7 @@ CONFIG_XNU_BUILD_ARCHIVES=y
 # No-op hooks for probes of the left-out components (scripts/build-link-stubs.py).
 CONFIG_XNU_EXTRA_LD_ARCHIVES="{tree}/build/link-stubs/libLinkStubs.a"
 CONFIG_XNU_NATIVE_MOBILE_DISPLAY=n
+# The display, key store stand-in and HID input (scripts/build-native-legacy-display.py, drivers/NativeMobileDisplay of the
+# pipa branch): IOMobileGraphicsFamily loaded from bsd_init, NativeLegacyDisplay on the firmware frame buffer.
+CONFIG_XNU_NATIVE_LEGACY_DISPLAY=y
 CONFIG_XNU_ARMVIRT_PLATFORM=n

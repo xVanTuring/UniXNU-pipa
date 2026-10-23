@@ -3,8 +3,10 @@
 # for the tablet to come back to fastboot by itself (package/BootRamoops.c restarts into fastboot with a warm reset 10 s after a
 # panic and pipa-restart-after seconds after boot), fetch the log with the log reader and print the kernel's own lines and the end.
 #
-# usage: scripts/kernel-round.sh [--no-build] [--twice] [TAIL_LINES]   (run from anywhere; UniXNU and uefi-pipa sit beside this
-#                                                                       repository)
+# usage: scripts/kernel-round.sh [--no-build] [--twice] [--arg NAME=VALUE]... [TAIL_LINES]   (run from anywhere; UniXNU and
+#                                                                       uefi-pipa sit beside this repository)
+# --arg adds a kernel argument for this round only (it replaces board.toml's argument of the same name), e.g.
+# --arg sheng-data-reset=1 to start the Data overlay over.
 # --twice builds the kernel twice, for a change of pipa_defconfig or of kernel headers (the boot progress objects compile against
 # the previous build's headers). The build reads the local IPSW (UNIXNU_IPSW), never Apple's server; it shares the UniXNU checkout
 # with other boards: it waits while another unixnu runs, and puts out/state.json back. The payload carries UniXNU-tb128fu's 8 GiB
@@ -16,10 +18,12 @@ uefi=$(cd "$here/../uefi-pipa" && pwd)
 serial=${PIPA_SERIAL:-68b7676d}
 build=1
 twice=0
+extra_args=""
 while [ $# -gt 0 ]; do
   case $1 in
     --no-build) build=0; shift ;;
     --twice) twice=1; shift ;;
+    --arg) extra_args="$extra_args --kernel-arg $2"; shift 2 ;;
     *) break ;;
   esac
 done
@@ -32,13 +36,15 @@ if [ $build = 1 ]; then
   while pgrep -f "unixnu (build|bootimg|fetch|defconfig)" > /dev/null; do echo "another unixnu is running, waiting"; sleep 10; done
   state=$(cat "$unixnu/out/state.json" 2>/dev/null)
   log=$unixnu/out/pipa/logs/kernel-round-build.log
+  # $extra_args is split on purpose: --kernel-arg NAME=VALUE words without spaces.
+  # shellcheck disable=SC2086
   (
     cd "$unixnu" || exit 1
     export UNIXNU_UEFI=$uefi UNIXNU_IPSW=$ipsw
     ./unixnu defconfig pipa_defconfig -D "$here" > "$log" 2>&1 &&
       ./unixnu build kernel -D "$here" >> "$log" 2>&1 &&
       { [ $twice = 0 ] || ./unixnu build kernel -D "$here" >> "$log" 2>&1; } &&
-      ./unixnu build payload -D "$here" --unique-chip-id "$(cat "$here/.cache/platform-seed")" \
+      ./unixnu build payload -D "$here" --unique-chip-id "$(cat "$here/.cache/platform-seed")" $extra_args \
         --data-ramdisk build/owner-data-fixture/owner-data-8g.dbr --skip-setup \
         --trust-cache build/original-static-system-trust/original-static-system.bundle >> "$log" 2>&1 &&
       ./unixnu bootimg -D "$here" --dtb "$uefi/Resources/DTBs/pipa.dtb" -o "$image" >> "$log" 2>&1
@@ -73,6 +79,10 @@ run=$(ls -td "$unixnu"/out/pipa/device-logs/2* | head -1)
 console=$run/pstore/console-ramoops-0
 [ -f "$console" ] || { echo "no console-ramoops-0 in $run"; exit 4; }
 echo "== $console ($(wc -l < "$console") lines)"
-grep -a -E "^\[xnu\] (restart|panic)|NATIVE_UFS" "$console" | cut -c1-300
+grep -a -E "^\[xnu\] (restart|panic|boot cpu)|NATIVE_UFS" "$console" | cut -c1-300
+grep -a "^\[xnu\] display: " "$console" | tail -3
+echo "processes started: $(grep -a -c 'exec process signature accepted' "$console")"
+echo "failed exits (count, name, status):"
+grep -a "^\[xnu\] exit " "$console" | grep -v "status 0x0 " | awk '{print $4, $6}' | sort | uniq -c | sort -rn | head -8
 echo "== end"
 tail -n "$lines" "$console" | cut -c1-300

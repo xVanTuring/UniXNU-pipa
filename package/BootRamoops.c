@@ -9,7 +9,8 @@
 // cpu_regs) no thread runs after that, so the hook itself appends the message buffer's rest and the panic text.
 //
 // The tablet restarts into fastboot by itself, with a warm reset that keeps the zone: pipa-restart-after=<s> seconds after
-// boot_progress_start (0 = never), and pipa-panic-restart-after=<s> (default 10) after a panic. The restart is uefi-pipa's
+// boot_progress_start (0 = never), pipa-panic-restart-after=<s> (default 10) after a panic, and after pipa-restart-crashes=<n>
+// crashes of SpringBoard or backboardd (0 = off), so a round that only repeats a UI crash ends early. The restart is uefi-pipa's
 // RamoopsLogLib RestartIntoFastboot, which the firmware verified on this tablet: the PM8150 PON's reboot reason (bootloader) and
 // its warm reset types through the SPMI arbiter (done once at boot_progress_start, from a thread), then at the restart the IMEM
 // restart reason, the two SCM calls (secure watchdog debug boot part off, PMIC arbiter halted) and PS_HOLD deasserted, with
@@ -79,12 +80,12 @@ void boot_progress_putc(char);
 void boot_progress_stage(const char *);
 void boot_progress_irq(u64, u64, u64);
 void boot_progress_poll(void);
-void boot_progress_user_breakpoint(void *, unsigned);
-void boot_progress_user_abort(void *, unsigned, u64);
-void boot_progress_critical_exit(int, char *, unsigned long);
 void boot_progress_process_stage(int, const char *, const char *);
 void boot_progress_exit(int, const char *, int, unsigned, u64);
 void boot_progress_panic_hook(void);
+int boot_progress_prepare_scanout(void);
+void boot_progress_cancel_scanout(void);
+int boot_progress_pulse_anchor(unsigned long, u64, unsigned, unsigned, unsigned);
 
 static volatile u8 *zone;                       // the zone's mapping, once boot_progress_start made it
 static char early[EARLY_SIZE];                  // what came before it
@@ -92,7 +93,8 @@ static u32 early_len;
 static volatile int lock;
 static u32 user_faults;
 static volatile u32 *ps_hold, *imem;            // the restart's registers, mapped by boot_progress_start
-static u32 restart_after, panic_restart_after = 10;
+static u32 restart_after, panic_restart_after = 10, restart_crashes;
+static volatile u32 ui_crashes;                 // SpringBoard and backboardd exits by a crash signal
 // Written by the panic screen (patch-xnu-entry-probe.py resolves the symbol), 256 bytes, the first panic's message.
 char boot_progress_panic_text[256];
 
@@ -132,7 +134,7 @@ static void put(const char *text, unsigned n) {
 }
 
 static void line(const char *prefix, const char *text) {
-  char buffer[320];
+  char buffer[768];
   int n = snprintf(buffer, sizeof buffer, "[xnu] %s%s\n", prefix, text ? text : "");
   if (n > 0) put(buffer, (unsigned)n < sizeof buffer ? (unsigned)n : (unsigned)sizeof buffer - 1);
 }
@@ -176,6 +178,51 @@ static u64 ticks_per_second(void) {u64 f; __asm__ volatile("mrs %0, cntfrq_el0" 
 static void delay_ms(u64 ms) {
   const u64 start = ticks(), wait = ticks_per_second() / 1000 * ms;
   while (ticks() - start < wait) {}
+}
+
+// A rough clock of the CPU running this: a counted loop of one subtract and one branch (about one iteration per cycle on these
+// cores) timed against the architected counter. Only a magnitude: whether the firmware left the core near its top or far below.
+static u32 cpu_mhz_estimate(void) {
+  u64 n = 50000000;
+  const u64 start = ticks();
+  __asm__ volatile("1: subs %0, %0, #1\n\tb.ne 1b" : "+r"(n) :: "cc");
+  const u64 elapsed = ticks() - start;
+  return elapsed ? (u32)(50000000ULL * ticks_per_second() / elapsed / 1000000) : 0;
+}
+
+// The CPU frequency hardware (pipa DT qcom,cpufreq-hw "qcom,cpufreq-hw-epss"): domain 0 at 0x18591000 runs CPUs 0-3 (Silver),
+// 1 at 0x18592000 CPUs 4-6 (Gold), 2 at 0x18593000 CPU 7 (Gold Prime). Register facts as Linux's qcom-cpufreq-hw uses them for EPSS
+// (epss_soc_data): 0x100 + 4*i the frequency lookup table (bits 31:30 the source, 0 = the 300 MHz alternate clock; bits 7:0 the
+// multiple of the 19.2 MHz XO; a repeated frequency ends the table), 0x320 the requested performance level (a table row).
+// pipa-cpufreq=1 asks each domain for its top row; the hardware's limits management still caps it. Logged either way.
+#define CPUFREQ_DOMAINS 3
+#define CPUFREQ_LUT     0x100U
+#define CPUFREQ_PERF    0x320U
+#define CPUFREQ_ROWS    40U
+static u32 cpufreq_mhz(u32 entry) {return ((entry >> 30) & 3) ? (entry & 0xff) * 192 / 10 : 300;}
+static void cpufreq(int request) {
+  static const u64 phys[CPUFREQ_DOMAINS] = {0x18591000UL, 0x18592000UL, 0x18593000UL};
+  static volatile u32 *domain[CPUFREQ_DOMAINS];
+  char text[256];
+  unsigned at = 0;
+  for (unsigned d = 0; d < CPUFREQ_DOMAINS && at + 64 < sizeof text; ++d) {
+    if (!domain[d]) domain[d] = (volatile u32 *)ml_io_map(phys[d], 0x1000);
+    volatile u32 *r = domain[d];
+    if (!r) {at += (unsigned)snprintf(text + at, sizeof text - at, "d%u unmapped | ", d); continue;}
+    u32 rows = 0, top = 0, top_mhz = 0, previous = 0;
+    for (; rows < CPUFREQ_ROWS; ++rows) {
+      u32 mhz = cpufreq_mhz(r[(CPUFREQ_LUT + 4 * rows) / 4]);
+      if (rows && mhz == previous) break;
+      if (mhz > top_mhz) {top_mhz = mhz; top = rows;}
+      previous = mhz;
+    }
+    if (request && rows) {r[CPUFREQ_PERF / 4] = top; __asm__ volatile("dsb sy" ::: "memory");}
+    u32 perf = r[CPUFREQ_PERF / 4];
+    at += (unsigned)snprintf(text + at, sizeof text - at, "d%u perf %u (%u MHz) of %u rows, top %u (%u MHz)%s | ", d, perf,
+                             perf < rows ? cpufreq_mhz(r[(CPUFREQ_LUT + 4 * perf) / 4]) : 0, rows, top, top_mhz,
+                             request ? " requested" : "");
+  }
+  line("cpufreq: ", text);
 }
 
 // One byte of a PMIC peripheral through the SPMI arbiter (RamoopsLogLib's SpmiRead8/SpmiWrite8). 0 = done.
@@ -269,15 +316,89 @@ __attribute__((noreturn)) static void restart_into_fastboot(void) {
   for (;;) __asm__ volatile("wfe");
 }
 
+// The display's counters (LegacyDisplayProbe.cpp, CONFIG_XNU_NATIVE_LEGACY_DISPLAY; weak, absent without it): the probe's
+// stage, the frame buffer it took, swaps the clients submitted, CPU copies, retired frames and user client calls.
+extern volatile u32 native_legacy_stage __attribute__((weak_import));
+extern volatile u32 native_legacy_gop_width __attribute__((weak_import));
+extern volatile u32 native_legacy_gop_height __attribute__((weak_import));
+extern volatile u32 native_legacy_swap_validation_calls __attribute__((weak_import));
+extern volatile u32 native_legacy_transfer_calls __attribute__((weak_import));
+extern volatile u32 native_legacy_retirement_calls __attribute__((weak_import));
+extern volatile u32 native_legacy_client_calls __attribute__((weak_import));
+extern volatile int native_legacy_unit_scale_status __attribute__((weak_import));
+extern volatile u32 native_legacy_unit_scale_calls __attribute__((weak_import));
+extern volatile u32 native_legacy_chosen_scale __attribute__((weak_import));
+extern volatile u32 native_legacy_chosen_rotation __attribute__((weak_import));
+// The cores (drivers/ArmCpu): each logical core's start step (7 = running), the cores running, IPIs sent and taken, and the
+// SPI block standing in for SGIs.
+extern volatile u32 armcpu_smp_step[8] __attribute__((weak_import));
+extern volatile u32 armcpu_smp_running __attribute__((weak_import));
+extern volatile unsigned long armcpu_ipi_sent __attribute__((weak_import));
+extern volatile unsigned long armcpu_ipi_interrupts __attribute__((weak_import));
+extern volatile u32 armcpu_spi_ipi_base __attribute__((weak_import));
+static void cpu_status(void) {
+  if (!&armcpu_smp_step || !&armcpu_smp_running || !&armcpu_ipi_sent || !&armcpu_ipi_interrupts || !&armcpu_spi_ipi_base) return;
+  char text[160];
+  snprintf(text, sizeof text, "running %u steps %u %u %u %u %u %u %u %u ipi sent %lu taken %lu spi base %u", armcpu_smp_running,
+           armcpu_smp_step[0], armcpu_smp_step[1], armcpu_smp_step[2], armcpu_smp_step[3], armcpu_smp_step[4], armcpu_smp_step[5],
+           armcpu_smp_step[6], armcpu_smp_step[7], armcpu_ipi_sent, armcpu_ipi_interrupts, armcpu_spi_ipi_base);
+  line("cpus: ", text);
+}
+
+// The lines sheng's progress page shows for other components (KeyStoreProbe.cpp writes line 0); logged with the display line.
+char boot_progress_ext[8][48];
+
+static void display_status(void) {
+  if (!&native_legacy_stage || !&native_legacy_gop_width || !&native_legacy_gop_height || !&native_legacy_swap_validation_calls ||
+      !&native_legacy_transfer_calls || !&native_legacy_retirement_calls || !&native_legacy_client_calls) return;
+  char text[224];
+  snprintf(text, sizeof text, "stage %u gop %ux%u swaps %u copies %u retired %u client calls %u unit scale %d/%u chosen %u rotation %u",
+           native_legacy_stage, native_legacy_gop_width, native_legacy_gop_height, native_legacy_swap_validation_calls,
+           native_legacy_transfer_calls, native_legacy_retirement_calls, native_legacy_client_calls,
+           &native_legacy_unit_scale_status ? native_legacy_unit_scale_status : -9,
+           &native_legacy_unit_scale_calls ? native_legacy_unit_scale_calls : 0, &native_legacy_chosen_scale ? native_legacy_chosen_scale : 0,
+           &native_legacy_chosen_rotation ? native_legacy_chosen_rotation : 0);
+  line("display: ", text);
+  for (unsigned i = 0; i < 8; ++i) {
+    if (!boot_progress_ext[i][0]) continue;
+    char ext[sizeof boot_progress_ext[i] + 1];
+    for (unsigned c = 0; c < sizeof boot_progress_ext[i]; ++c) ext[c] = boot_progress_ext[i][c];
+    ext[sizeof boot_progress_ext[i]] = 0;
+    line("ext: ", ext);
+  }
+}
+
+// The display hand-off of sheng's progress page (LegacyDisplayProbe.cpp asks before a CPU scanout copy): there is no page on
+// this board, so the display always takes the frame buffer; the first copy is logged as the first frame.
+int boot_progress_prepare_scanout(void) {
+  static int first = 1;
+  if (first) {first = 0; line("display: ", "first scanout copy, the display takes the frame buffer");}
+  return 1;
+}
+void boot_progress_cancel_scanout(void) {}
+// The page's anchor on the display's frame buffer mapping (LegacyDisplayProbe.cpp offers it once): no page, so none is taken.
+int boot_progress_pulse_anchor(unsigned long base, u64 bytes, unsigned width, unsigned height, unsigned rowbytes) {
+  (void)base; (void)bytes; (void)width; (void)height; (void)rowbytes;
+  return 0;
+}
+
 static void writer(void *argument, int result) {
   (void)argument; (void)result;
   const u64 start = ticks(), limit = ticks_per_second() * restart_after;
-  for (;;) {
+  for (u32 pass = 1;; ++pass) {
     messages();
     panic_text(0);
+    if (pass % 100 == 0) {display_status(); cpu_status();}
     if (restart_after && ticks() - start >= limit) {
       char text[64];
       snprintf(text, sizeof text, "%u s after the zone was mapped (pipa-restart-after)", restart_after);
+      line("restart into fastboot: ", text);
+      restart_into_fastboot();
+    }
+    if (restart_crashes && ui_crashes >= restart_crashes) {
+      messages();
+      char text[80];
+      snprintf(text, sizeof text, "%u SpringBoard/backboardd crashes (pipa-restart-crashes)", ui_crashes);
       line("restart into fastboot: ", text);
       restart_into_fastboot();
     }
@@ -316,6 +437,7 @@ void boot_progress_start(void) {
   give(daif);
   PE_parse_boot_argn("pipa-restart-after", &restart_after, sizeof restart_after);
   PE_parse_boot_argn("pipa-panic-restart-after", &panic_restart_after, sizeof panic_restart_after);
+  PE_parse_boot_argn("pipa-restart-crashes", &restart_crashes, sizeof restart_crashes);
   u32 pon = prepare_warm_fastboot();
   ps_hold = (volatile u32 *)ml_io_map(PS_HOLD, 0x1000);
   volatile u8 *imem_page = (volatile u8 *)ml_io_map(IMEM_RESTART_REASON & ~0xFFFUL, 0x1000);
@@ -324,6 +446,15 @@ void boot_progress_start(void) {
   snprintf(text, sizeof text, "PON 0x%x (%s), PS_HOLD %s, after %u s, after a panic %u s", pon, pon ? "not prepared" : "warm, bootloader",
            ps_hold && imem ? "mapped" : "NOT mapped", restart_after, panic_restart_after);
   line("restart into fastboot: ", text);
+  snprintf(text, sizeof text, "about %u MHz (a counted loop against the counter)", cpu_mhz_estimate());
+  line("boot cpu: ", text);
+  u32 want_cpufreq = 0;
+  PE_parse_boot_argn("pipa-cpufreq", &want_cpufreq, sizeof want_cpufreq);
+  cpufreq(want_cpufreq == 1);
+  if (want_cpufreq == 1) {
+    snprintf(text, sizeof text, "about %u MHz after the request", cpu_mhz_estimate());
+    line("boot cpu: ", text);
+  }
   void *thread = 0;
   if (kernel_thread_start(writer, 0, &thread) == 0) thread_deallocate(thread);
   else line("", "message buffer thread NOT started");
@@ -338,30 +469,15 @@ void boot_progress_stage(const char *text) {line("stage: ", text);}
 void boot_progress_irq(u64 pc, u64 cpsr, u64 sp) {(void)pc; (void)cpsr; (void)sp;}
 void boot_progress_poll(void) {}
 
-void boot_progress_user_breakpoint(void *state, unsigned esr) {
-  (void)state;
-  if (user_faults >= 64) return;
-  ++user_faults;
-  char text[64];
-  snprintf(text, sizeof text, "esr 0x%x", esr);
-  line("user breakpoint: ", text);
+static int same(const char *a, const char *b) {
+  while (*a && *a == *b) {++a; ++b;}
+  return *a == *b;
 }
 
-void boot_progress_user_abort(void *state, unsigned esr, u64 address) {
-  (void)state;
-  if (user_faults >= 64) return;
-  ++user_faults;
-  char text[80];
-  snprintf(text, sizeof text, "esr 0x%x address 0x%llx", esr, (unsigned long long)address);
-  line("user abort: ", text);
-}
-
-void boot_progress_critical_exit(int pid, char *text, unsigned long capacity) {
-  (void)capacity;
-  char prefix[48];
-  snprintf(prefix, sizeof prefix, "critical exit %d: ", pid);
-  line(prefix, text);
-}
+// boot_progress_user_breakpoint, boot_progress_user_abort and boot_progress_critical_exit are BootFaultProbe.c's (the EL0
+// exception records); a crashing exit below asks it for the crash line, as sheng's progress page does.
+extern void boot_progress_exit_fault(int pid, unsigned signal, char *out, unsigned long capacity);
+extern void boot_progress_exit_reason(int pid, unsigned signal, char *out, unsigned long capacity);
 
 void boot_progress_process_stage(int pid, const char *name, const char *stage) {
   char prefix[96];
@@ -369,9 +485,23 @@ void boot_progress_process_stage(int pid, const char *name, const char *stage) {
   line(prefix, stage);
 }
 
+// Every exit; for one by signal 3..12 (not 9) also the crash line (pid, name, signal, PC, LR, ESR, FAR, the shared cache slide
+// and a frame walk), and for SIGABRT the uncaught exception's reason found in the process's memory. At most 48 crash lines.
 void boot_progress_exit(int pid, const char *name, int status, unsigned reason_namespace, u64 reason_code) {
-  char text[160];
+  char text[640];
   snprintf(text, sizeof text, "%d %s status 0x%x reason %u/0x%llx", pid, name ? name : "?", status, reason_namespace,
            (unsigned long long)reason_code);
   line("exit ", text);
+  const unsigned signal = (unsigned)status & 0x7f;
+  if (signal < 3 || signal > 12 || signal == 9) return;
+  if (name && (same(name, "SpringBoard") || same(name, "backboardd"))) ui_crashes = ui_crashes + 1;
+  if (user_faults >= 48) return;
+  ++user_faults;
+  text[0] = 0;
+  boot_progress_exit_fault(pid, signal, text, sizeof text);
+  if (text[0]) line("crash: ", text);
+  if (signal != 6) return;
+  text[0] = 0;
+  boot_progress_exit_reason(pid, signal, text, sizeof text);
+  if (text[0]) line("crash reason: ", text);
 }

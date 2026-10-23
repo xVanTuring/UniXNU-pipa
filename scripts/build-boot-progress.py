@@ -17,26 +17,36 @@ obj, archive = out / 'BootRamoops.o', out / 'libBootProgress.a'
 subprocess.run(['xcrun', '--sdk', 'iphoneos', 'clang', '-arch', 'arm64', '-mkernel', '-miphoneos-version-min=17.0',
                 '-mgeneral-regs-only', '-Os', '-Wall', '-Wextra', '-Werror', '-c', source, '-o', obj], check=True)
 
-# kern_exec.o's own command with the policy source and object in place of its own, warnings of the record dropped.
-policy_source, policy_obj = ROOT / 'kits/pipa/BootWatchdogPolicy.c', out / 'BootWatchdogPolicy.o'
-record = json.loads((ROOT / 'build/xnu/ios-obj/DEVELOPMENT_ARM64_BCM2837/bsd/DEVELOPMENT/kern_exec.o.json').read_text().strip().rstrip(','))
-command, args, i = [], record['arguments'], 0
-while i < len(args):
-    arg = args[i]
-    if arg == record['file']:
-        command.append(str(policy_source))
-    elif arg in ('-o', '-MF', '-MT', '-MJ'):
-        if arg == '-o':
-            command += ['-o', str(policy_obj)]
+def compile_like(object_record, source, target, extra):
+    """An XNU object's own compile command (its build record) with SOURCE and TARGET in place of its own, warnings dropped."""
+    record = json.loads((ROOT / 'build/xnu/ios-obj/DEVELOPMENT_ARM64_BCM2837' / object_record).read_text().strip().rstrip(','))
+    command, args, i = [], record['arguments'], 0
+    while i < len(args):
+        arg = args[i]
+        if arg == record['file']:
+            command.append(str(source))
+        elif arg in ('-o', '-MF', '-MT', '-MJ'):
+            if arg == '-o':
+                command += ['-o', str(target)]
+            i += 1
+        elif arg == '-Xclang' and args[i + 1].startswith('-W'):
+            i += 1
+        elif not arg.startswith('-W'):
+            command.append(arg)
         i += 1
-    elif arg == '-Xclang' and args[i + 1].startswith('-W'):
-        i += 1
-    elif not arg.startswith('-W'):
-        command.append(arg)
-    i += 1
-command += ['-mgeneral-regs-only', '-Wall', '-Wextra', '-Werror']
-subprocess.run(command, cwd=record['directory'], check=True, timeout=90)
+    subprocess.run(command + ['-mgeneral-regs-only', '-Wall', '-Wextra', '-Werror', *extra], cwd=record['directory'], check=True,
+                   timeout=90)
+
+# The policy with kern_exec.o's command (BSD).
+policy_obj = out / 'BootWatchdogPolicy.o'
+compile_like('bsd/DEVELOPMENT/kern_exec.o.json', ROOT / 'kits/pipa/BootWatchdogPolicy.c', policy_obj, [])
+# kits/pipa/BootFaultProbe.c (UniXNU-tb128fu's, from sheng): the EL0 breakpoint/abort records and the crash line of an exiting
+# process, which BootRamoops.c writes to the log. It reads Mach's task and VM internals: startup.o's command (osfmk), as
+# UniXNU-tb128fu compiles it.
+fault_obj = out / 'BootFaultProbe.o'
+compile_like('osfmk/DEVELOPMENT/startup.o.json', ROOT / 'kits/pipa/BootFaultProbe.c', fault_obj,
+             ['-I', str(ROOT / '.cache/xnu-work/osfmk')])
 
 archive.unlink(missing_ok=True)
-subprocess.run(['xcrun', 'ar', 'rcs', archive, obj, policy_obj], check=True)
+subprocess.run(['xcrun', 'ar', 'rcs', archive, obj, policy_obj, fault_obj], check=True)
 print(archive)

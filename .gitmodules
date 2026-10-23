@@ -2,3 +2,11 @@
 	path = drivers/NativeUfs
 	url = https://github.com/xVanTuring/NativeUfs.git
 	branch = pipa
+[submodule "drivers/NativeMobileDisplay"]
+	path = drivers/NativeMobileDisplay
+	url = https://github.com/xVanTuring/NativeMobileDisplay.git
+	branch = pipa
+[submodule "drivers/ArmCpu"]
+	path = drivers/ArmCpu
+	url = https://github.com/xVanTuring/ArmCpu.git
+	branch = pipa

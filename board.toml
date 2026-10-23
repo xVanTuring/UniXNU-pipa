@@ -59,6 +59,9 @@ archives = [
   # The 395-byte owner root anchor and the XNU crypto adapter, the same pinned key as UniXNU-tb128fu; the signed envelopes are
   # in userdata (UniXNU-tb128fu's userdata-root image).
   "build-verified-root-key.py --pin 70a5ea346d2d779a7ef43eb4ed8b17f54488e160d8c2a6d6420969664e3ae798",
+  # The display, key store stand-in and HID input (CONFIG_XNU_NATIVE_LEGACY_DISPLAY); it reads the previous kernel step's
+  # kernel.macho and UniXNU-qemu's display reference (see its header).
+  "build-native-legacy-display.py",
 ]
 
 # The same original kernelcache and prelink selection as UniXNU-sheng: the target image is the same.
@@ -187,10 +190,40 @@ kernel_args = [
   "-no_corpses",
   "sheng-disable-jobs=com.apple.identityservicesd,com.apple.locationd,com.apple.CommCenter,com.apple.bluetoothd,com.apple.PerfPowerServices,com.apple.iomfb_fdr_loader",
   "sheng-disable-watchdogd=1",
+  # The display as on UniXNU-tb128fu before its GPU (and UniXNU-qemu): IOMobileGraphicsFamily loaded from bsd_init,
+  # NativeLegacyDisplay on the firmware frame buffer as the system display (phase 4), CPU presentation, the key store stand-in
+  # (liveactivitiesd's Keybag needs AppleKeyStore, or SpringBoard waits on chronod forever) and the HID input with a Home
+  # button. Without it SpringBoard traps on "failed to find the main CADisplay" (pipa, 2026-10-23: 16 times in 420 s).
+  "offline-mobile-graphics-load=1",
+  "offline-legacy-register=1",
+  "offline-legacy-phase=4",
+  "offline-legacy-gop=1",
+  "offline-legacy-unit-scale=1",
+  "offline-legacy-pm=1",
+  "offline-legacy-validate=1",
+  "offline-legacy-transfer=1",
+  "offline-legacy-cpu-present=1",
+  "offline-key-events=1",
+  "sheng-aks=1",
+  "offline-hid-input=1",
+  "offline-hid-home=1",
+  "sheng-touch-hid=1",
+  # A fixed 60 Hz for the render server (drivers/NativeMobileDisplay): a work-loop tick stands in for the GOP scanout's missing
+  # vblank; with the generic 24 to 60 Hz range UniXNU-tb128fu's render server settled at 24 Hz.
+  "sheng-vsync=60",
+  "sheng-vsync-fixed=1",
   # The kernel restarts into fastboot by itself with a warm reset that keeps the ramoops log (package/BootRamoops.c): this
-  # long after the log zone is mapped (one CPU: user space starts slower than TB128FU's 72 s with eight), and 10 s (the
-  # default of pipa-panic-restart-after) after a panic.
-  "pipa-restart-after=420",
+  # long after the log zone is mapped, after the third SpringBoard/backboardd crash, and 10 s (the default of
+  # pipa-panic-restart-after) after a panic. One CPU, 2026-10-23: launchd at +1 s, SpringBoard at +50 s, its first crash at +94 s.
+  "pipa-restart-after=240",
+  "pipa-restart-crashes=3",
+  # All eight cores ([payload.adt] cpu_regs, ArmCpu of drivers/ArmCpu's pipa branch, PSCI CPU_ON), as on UniXNU-tb128fu and
+  # UniXNU-sheng: every core sends itself an IPI from initCPU (XNU enables a core's IPIs only once it has taken one), and IPIs
+  # are software-pended SPIs, since SGIs do not arrive on these Qualcomm boards; without armcpu-spi-ipi-base ArmCpu takes the
+  # distributor's top eight INTIDs. The virtual timer is the standard INTID 27 here (DT timer PPIs 13, 14, 11, 12).
+  "sheng-smp=1",
+  "armcpu-self-ipi=1",
+  "armcpu-spi-ipi=1",
 ]
 
 [payload.adt]
@@ -200,7 +233,9 @@ chip_id = "207"
 # 0xffc20000..0x27fffffff (6 GiB) free in the second bank, and the third bank has 8 GiB.
 owned_memory_size = "0x100000000"
 root_match_volume_uuid = "04769D26-2CA0-4825-B443-E2E5F88300F2"   # the OS volume of the same IPSW
-cpu_regs = "0"                       # the boot CPU only; all eight are 0,0x100,0x200,0x300,0x400,0x500,0x600,0x700
+# All eight cores, boot CPU first: 0..0x300 Kryo 585 Silver (Cortex-A55), 0x400..0x600 Gold and 0x700 Gold Prime (Cortex-A77),
+# one scheduler cluster (no cluster-type, as on sheng). "0" keeps the boot CPU only (pipa's first boots, 2026-10-23).
+cpu_regs = "0,0x100,0x200,0x300,0x400,0x500,0x600,0x700"
 packed_data_ramdisk = true
 ipad_identity = true
 unique_chip_id = "required"          # the platform seed is not stored in any repository
