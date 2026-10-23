@@ -1,11 +1,9 @@
-# Kernel configuration of the first pipa image: the generic CPU, interrupt, timer and platform expert path, the source
-# corecrypto and pthread providers and NativeAES, enough to reach the root mount. CONFIG_XNU_<NAME> becomes XNU_<NAME>
-# for the kernel build.
+# Kernel configuration of pipa: the generic CPU, interrupt, timer and platform expert path, the source corecrypto and
+# pthread providers, NativeAES, the SM8250 UFS root and the owner root chain of UniXNU-tb128fu. CONFIG_XNU_<NAME> becomes
+# XNU_<NAME> for the kernel build.
 #
-# Left out until their board or image inputs exist: the owner root chain
-# (VERIFIED_ROOT_PROBE, OWNER_*; it needs owner-signed volume policies),
-# NATIVE_LEGACY_DISPLAY (its archive carries the sheng board probes), NATIVE_RAM_BLOCK and SOURCE_MOCKFS (no Data or
-# fixture root yet) and NATIVE_ADRENO. SHENG_PMGR links the original-PMGR bridge (scripts/build-platform-power.py),
+# Left out until their board inputs exist: NATIVE_LEGACY_DISPLAY (the display stack, next) and NATIVE_ADRENO.
+# SHENG_PMGR links the original-PMGR bridge (scripts/build-platform-power.py),
 # without which the original AMFI panics with "No PMGR". On the QEMU board the same kernel draws nothing through XNU's
 # video console despite -v: after the entry probe bars, the panic screen is the only kernel output on the frame buffer.
 
@@ -20,16 +18,39 @@ CONFIG_XNU_DT_PANIC_REGION=y
 CONFIG_XNU_NATIVE_ARCH_TIMER=y
 CONFIG_XNU_NATIVE_PAN=y
 CONFIG_XNU_SHENG_PMGR=y
-# NativeUfs of drivers/NativeUfs (pipa branch, SM8250 constants), built --probe-only: the controller probes chosen by
-# native-ufs-probe, no block device or root publication yet.
+# NativeUfs of drivers/NativeUfs (pipa branch, SM8250 constants) with the VerifiedRoot owner policy, as on UniXNU-tb128fu: the
+# kernel carries only the 395-byte owner key (build/verified-root-key); the signed OS/SystemOS envelopes are in the userdata
+# policy directory (SHNGPOL1) and are read at run time. userdata holds UniXNU-tb128fu's image (the same IPSW and owner key;
+# the image does not depend on the board).
 CONFIG_XNU_NATIVE_UFS=y
+# Verified variant: its root authorization query is what the owner chain below calls. No virtio device exists on this
+# board, so its own block transport never configures.
+CONFIG_XNU_NATIVE_VIRTIO_BLOCK=y
+CONFIG_XNU_NATIVE_VIRTIO_BLOCK_ARCHIVE="{tree}/build/native-virtio-block-verified/libNativeVirtioBlock.a"
+# The Data seed: a packed APFS scratch volume published as a RAM block device.
+CONFIG_XNU_NATIVE_RAM_BLOCK=y
+# Owner root chain, the same ladder as UniXNU-tb128fu and UniXNU-sheng: audit/trust the verified root, mount the SystemOS
+# cryptex as the cache carrier, publish the boot manifest, then mount the scratch Data volume.
+CONFIG_XNU_VERIFIED_ROOT_PROBE=y
+CONFIG_XNU_OWNER_ROOT_AUDIT=y
+CONFIG_XNU_OWNER_ROOT_TRUST=y
+CONFIG_XNU_OWNER_CACHE_MOUNT=y
+CONFIG_XNU_OWNER_CACHE_STARTUP=y
+CONFIG_XNU_OWNER_BOOT_MANIFEST=y
+CONFIG_XNU_OWNER_DATA_MOUNT=y
+CONFIG_XNU_OWNER_UNION_SYSTEMOS=y
+CONFIG_XNU_OWNER_CACHE_VOLUME_UUID="8846FE78-2910-4297-AF97-D59BB6F8FC16"
+CONFIG_XNU_OWNER_DATA_VOLUME_UUID="73F1FA24-4189-446D-96D4-FB6324EBE955"
+CONFIG_XNU_VERIFIED_ROOT_ARCHIVE="{tree}/build/verified-root-key/libVerifiedRootKey.a"
 # The boot progress hooks, implemented by the board's ramoops kernel log (package/BootRamoops.c, scripts/build-boot-progress.py)
-# instead of sheng's progress page, which needs the owner root chain: stages, process events and the message buffer go into the
-# stock ramoops console zone. STANDALONE: none of the progress page's inputs (UFS, owner root audit, Virtio) are required.
+# instead of sheng's progress page: stages, process events and the message buffer go into the stock ramoops console zone.
+# STANDALONE: the build does not insist on the progress page's inputs.
 CONFIG_XNU_BOOT_PROGRESS=y
 CONFIG_XNU_BOOT_PROGRESS_STANDALONE=y
 
 CONFIG_XNU_CRYPTO_BOOTSTRAP="prelinked"
+# Run board.toml's [kernel] archives before the kernel link (without it a newly listed archive is missing at the link).
+CONFIG_XNU_BUILD_ARCHIVES=y
 # No-op hooks for probes of the left-out components (scripts/build-link-stubs.py).
 CONFIG_XNU_EXTRA_LD_ARCHIVES="{tree}/build/link-stubs/libLinkStubs.a"
 CONFIG_XNU_NATIVE_MOBILE_DISPLAY=n

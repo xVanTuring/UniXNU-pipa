@@ -7,7 +7,8 @@
 #                                                                       repository)
 # --twice builds the kernel twice, for a change of pipa_defconfig or of kernel headers (the boot progress objects compile against
 # the previous build's headers). The build reads the local IPSW (UNIXNU_IPSW), never Apple's server; it shares the UniXNU checkout
-# with other boards: it waits while another unixnu runs, and puts out/state.json back.
+# with other boards: it waits while another unixnu runs, and puts out/state.json back. The payload carries UniXNU-tb128fu's 8 GiB
+# Data seed with Setup marked done and the original static + System trust caches (UniXNU's build/, see UniXNU-tb128fu's README).
 set -u
 here=$(cd "$(dirname "$0")/.." && pwd)
 unixnu=$(cd "$here/../UniXNU" && pwd)
@@ -37,7 +38,9 @@ if [ $build = 1 ]; then
     ./unixnu defconfig pipa_defconfig -D "$here" > "$log" 2>&1 &&
       ./unixnu build kernel -D "$here" >> "$log" 2>&1 &&
       { [ $twice = 0 ] || ./unixnu build kernel -D "$here" >> "$log" 2>&1; } &&
-      ./unixnu build payload -D "$here" --unique-chip-id "$(cat "$here/.cache/platform-seed")" >> "$log" 2>&1 &&
+      ./unixnu build payload -D "$here" --unique-chip-id "$(cat "$here/.cache/platform-seed")" \
+        --data-ramdisk build/owner-data-fixture/owner-data-8g.dbr --skip-setup \
+        --trust-cache build/original-static-system-trust/original-static-system.bundle >> "$log" 2>&1 &&
       ./unixnu bootimg -D "$here" --dtb "$uefi/Resources/DTBs/pipa.dtb" -o "$image" >> "$log" 2>&1
   )
   rc=$?

@@ -46,12 +46,19 @@ archives = [
   "build-arm-driver.py ArmDTPlatform",
   "build-arm-driver.py ArmCpu",
   "build-arm-driver.py NativeAES",
-  # drivers/NativeUfs (the pipa branch): the SM8250 host, controller probes only for now (no block device or root).
-  "build-arm-driver.py NativeUfs --sm8250 --probe-only",
+  # drivers/NativeUfs (the pipa branch): the SM8250 host with the verified block device and root publication.
+  "build-arm-driver.py NativeUfs --sm8250",
+  "build-arm-driver.py NativeVirtioBlock --verified-root",
+  "build-native-virtio-bindings.py --component NativeVirtioBlock --directory build/native-virtio-block-verified",
+  "build-arm-driver.py NativeRamBlock",
+  "build-native-virtio-bindings.py --component NativeRamBlock --directory build/native-ram-block",
   "build-native-aes-bindings.py",
   "build-libpthread-kernel.py",
   "build-link-stubs.py",
   "build-platform-power.py",
+  # The 395-byte owner root anchor and the XNU crypto adapter, the same pinned key as UniXNU-tb128fu; the signed envelopes are
+  # in userdata (UniXNU-tb128fu's userdata-root image).
+  "build-verified-root-key.py --pin 70a5ea346d2d779a7ef43eb4ed8b17f54488e160d8c2a6d6420969664e3ae798",
 ]
 
 # The same original kernelcache and prelink selection as UniXNU-sheng: the target image is the same.
@@ -146,6 +153,9 @@ title = "pipa first boot: source 4K XNU to the panic screen"
 # last bank; every register block lies below 0x80000000.
 dram_size = "0x980000000"
 skip_setup_tool = "scripts/seed-data-skip-setup.py"
+# No input device yet: without these SpringBoard preferences iPadOS turns the display off about 30 s after it starts and
+# puts the system to sleep, which ArmCpu does not support (UniXNU-tb128fu, UniXNU-qemu).
+skip_setup_args = ["--no-auto-dim"]
 panic_screen = true                  # patch panic() screen output into the payload copy of the kernel
 # The original static/System trust caches of the same IPSW, as accepted by UniXNU-sheng.
 trust_cache_sha256 = [
@@ -164,12 +174,23 @@ kernel_args = [
   "sheng-pmgr=2",
   "-no_slto_panic",
   "ml-timeout-lock-panic-scale=40",
-  # NativeUfs survey of the SM8250 UFS (clocks, controller, SMMU) into the kernel log, then the read-only GPT check
-  # (bring-up, LUN 0 GPT, userdata's first block), which ends in a panic with its result.
-  "native-ufs-probe=16",
-  # The kernel restarts into fastboot by itself with a warm reset that keeps the ramoops log (package/BootRamoops.c): 300 s
-  # after the log zone is mapped, and 10 s (the default of pipa-panic-restart-after) after a panic.
-  "pipa-restart-after=300",
+  # Publish the OS/SystemOS windows of userdata (UniXNU-tb128fu's image) through the verified block path; the signed
+  # envelopes come from its policy directory, and diagnostics turn a refused policy into a panic report. native-ufs-probe=16
+  # (the survey and read check, 2026-10-23) is the step before.
+  "native-ufs-root=1",
+  "native-ufs-diagnostics=1",
+  # The Data seed is larger than 2 GiB, so changed pages go through the store window after the root image in userdata.
+  "sheng-data-persist=2",
+  # As on UniXNU-tb128fu: no corpses for crashing processes (their footprint walk took half the CPU there), launchd is told
+  # not to start the jobs of SpringBoard's wait cycle and the ones that restart endlessly without their hardware, and not
+  # watchdogd (no AppleARMWatchdogTimer backend; its exit is fatal).
+  "-no_corpses",
+  "sheng-disable-jobs=com.apple.identityservicesd,com.apple.locationd,com.apple.CommCenter,com.apple.bluetoothd,com.apple.PerfPowerServices,com.apple.iomfb_fdr_loader",
+  "sheng-disable-watchdogd=1",
+  # The kernel restarts into fastboot by itself with a warm reset that keeps the ramoops log (package/BootRamoops.c): this
+  # long after the log zone is mapped (one CPU: user space starts slower than TB128FU's 72 s with eight), and 10 s (the
+  # default of pipa-panic-restart-after) after a panic.
+  "pipa-restart-after=420",
 ]
 
 [payload.adt]
