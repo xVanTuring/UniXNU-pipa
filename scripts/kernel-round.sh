@@ -79,8 +79,9 @@ run=$(ls -td "$unixnu"/out/pipa/device-logs/2* | head -1)
 console=$run/pstore/console-ramoops-0
 [ -f "$console" ] || { echo "no console-ramoops-0 in $run"; exit 4; }
 echo "== $console ($(wc -l < "$console") lines)"
-grep -a -E "^\[xnu\] (restart|panic|boot cpu)|NATIVE_UFS" "$console" | cut -c1-300
-grep -a "^\[xnu\] display: " "$console" | tail -3
+grep -a -o -E "\[xnu\] (restart|panic|boot cpu|cpufreq).*|NATIVE_UFS.*" "$console" | cut -c1-300
+grep -a -o "\[xnu\] display: .*" "$console" | tail -3
+grep -a -o "\[xnu\] cpus: .*" "$console" | tail -1
 echo "processes started: $(grep -a -c 'exec process signature accepted' "$console")"
 echo "failed exits (count, name, status):"
 grep -a "^\[xnu\] exit " "$console" | grep -v "status 0x0 " | awk '{print $4, $6}' | sort | uniq -c | sort -rn | head -8

@@ -91,6 +91,7 @@ static volatile u8 *zone;                       // the zone's mapping, once boot
 static char early[EARLY_SIZE];                  // what came before it
 static u32 early_len;
 static volatile int lock;
+static char last_byte = '\n';                   // the zone's last byte written, for line()
 static u32 user_faults;
 static volatile u32 *ps_hold, *imem;            // the restart's registers, mapped by boot_progress_start
 static u32 restart_after, panic_restart_after = 10, restart_crashes;
@@ -123,6 +124,7 @@ static void zone_put(const char *text, unsigned n) {
   size = size + n > ZONE_DATA ? (u32)ZONE_DATA : size + n;
   head[1] = start;
   head[2] = size;
+  if (n) last_byte = text[n - 1];
   __asm__ volatile("dsb sy" ::: "memory");
 }
 
@@ -133,9 +135,10 @@ static void put(const char *text, unsigned n) {
   give(daif);
 }
 
+// A line of its own: after message buffer text that has not ended its line (msgbuf passes cut anywhere), a newline first.
 static void line(const char *prefix, const char *text) {
   char buffer[768];
-  int n = snprintf(buffer, sizeof buffer, "[xnu] %s%s\n", prefix, text ? text : "");
+  int n = snprintf(buffer, sizeof buffer, "%s[xnu] %s%s\n", last_byte == '\n' ? "" : "\n", prefix, text ? text : "");
   if (n > 0) put(buffer, (unsigned)n < sizeof buffer ? (unsigned)n : (unsigned)sizeof buffer - 1);
 }
 

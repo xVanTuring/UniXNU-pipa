@@ -198,7 +198,9 @@ kernel_args = [
   "offline-legacy-register=1",
   "offline-legacy-phase=4",
   "offline-legacy-gop=1",
-  "offline-legacy-unit-scale=1",
+  # The UI scale: 2 frame buffer pixels per point, 900x1440 points on the 1800x2880 panel (as an iPad's 2x; at 1 the lock screen of
+  # 2026-10-23 was half size). MobileGestalt caches the scale in the Data overlay: a change needs one sheng-data-reset=1 round.
+  "offline-legacy-unit-scale=2",
   "offline-legacy-pm=1",
   "offline-legacy-validate=1",
   "offline-legacy-transfer=1",
@@ -224,6 +226,8 @@ kernel_args = [
   "sheng-smp=1",
   "armcpu-self-ipi=1",
   "armcpu-spi-ipi=1",
+  # Ask each CPU frequency domain (EPSS) for its top level (package/BootRamoops.c): the boot core ran at about 760 MHz.
+  "pipa-cpufreq=1",
 ]
 
 [payload.adt]
