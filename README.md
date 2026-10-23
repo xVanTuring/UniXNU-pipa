@@ -1,10 +1,14 @@
 # UniXNU-pipa
 
-> **Work in progress.** Prepared without the tablet; nothing here has run on a pipa yet.
+> **Work in progress.** On the tablet (2026-10-23): the firmware reaches the UniXNU menu, and XNU starts and stops where it needs storage.
 
 Device repository for the Xiaomi Pad 6 (pipa, SM8250), laid out like [UniXNU-sheng](https://github.com/UniXNU/UniXNU-sheng). Firmware: [uefi-pipa](https://github.com/xVanTuring/uefi-pipa), branch `pipa`, a fork of [uefi-sheng](https://github.com/UniXNU/uefi-sheng) whose upstream Mu-Silicium tree already carries `pipaPkg`.
 
-**State: prepared without the tablet. Nothing here has run on a pipa.** The static checks pass (see [Checks](#checks)); every hardware value names its public source.
+**State on the tablet (2026-10-23):** uefi-pipa 1f6a1520 reaches the UniXNU menu (without a payload it reports that it found no
+operating system). With the payload in the boot image (204 MB, accepted by `fastboot boot`), DarwinBoot hands over and XNU stops at
+`Failed to mount root device @IOKitBSDInit.cpp:984`, as expected without a storage driver. XNU has no log route yet; the firmware
+writes its log into the stock ramoops area (see uefi-pipa). The static checks pass (see [Checks](#checks)); every hardware value
+names its public source.
 
 ## What is here
 
@@ -77,7 +81,7 @@ The platform seed is any nonzero 64-bit value kept for this tablet, for example 
 
 On a new tree the PMGR bridge has no reference kernel yet: the first `build kernel` links a no-op in its place and says so, and the second links the bridge.
 
-Expected: DarwinBoot hands over, the entry probe bars (green, blue, magenta) appear at the top of the screen, and the panic screen shows `Failed to mount root device`, as there is no storage driver yet. XNU's video console does not draw the kernel log despite `-v`. The same kernel configuration reaches that point on the QEMU board of [UniXNU-qemu](https://github.com/xVanTuring/UniXNU-qemu).
+Expected: DarwinBoot hands over, the entry probe bars (green, blue, magenta) appear at the top of the screen, and the panic screen shows `Failed to mount root device`, as there is no storage driver yet. On the tablet (2026-10-23, the payload of 2026-10-21): the green and blue bars, then `Failed to mount root device @IOKitBSDInit.cpp:984` with the TCR, SCTLR, page and free counts below it. XNU's video console does not draw the kernel log despite `-v`. The same kernel configuration reaches that point on the QEMU board of [UniXNU-qemu](https://github.com/xVanTuring/UniXNU-qemu).
 
 ## Values taken from the tablet
 
