@@ -231,6 +231,9 @@ kernel_args = [
   # The touch controller (package/TouchProbe.cpp, Novatek NT36532 on QUP wrapper 0 SE4): every stage up to the point-report loop
   # that feeds the HID input (sheng-touch-hid). Its rows go to the kernel log every 10 s; the first failing stage stops it.
   "pipa-touch=5",
+  # The power and volume keys (package/Buttons.c): the PM8150 PON's and GPIO6's status over SPMI every 10 ms, read only, to the HID
+  # input's report 2 (power, volume up, volume down). Each change is logged.
+  "pipa-buttons=1",
 ]
 
 [payload.adt]

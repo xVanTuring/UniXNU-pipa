@@ -308,7 +308,8 @@ def c_compile(c_source,c_obj):
         j+=1
     run(out+['-Wall','-Wextra','-Werror']+touch_includes,cwd=c_record['directory'])
 touch_objs=[probe_obj]
-for c_source in (ROOT/'drivers/NativeGeniSpi/GeniSpi.c',ROOT/'drivers/NativeNovatekTouch/NvtProtocol.c',firmware_c):
+# Buttons.c (pipa-buttons=1, the power and volume keys over SPMI for the HID input) goes the same way.
+for c_source in (ROOT/'drivers/NativeGeniSpi/GeniSpi.c',ROOT/'drivers/NativeNovatekTouch/NvtProtocol.c',firmware_c,ROOT/'kits/pipa/Buttons.c'):
     c_obj=touch_dir/(c_source.stem+'.o');c_compile(c_source,c_obj);touch_objs.append(c_obj)
 # The display backend, its probe, the key store, the HID input and the touch controller: UniXNU-tb128fu's Himax touch, GPU, RPM and
 # USB log probes, sheng's touch panel (THP), CPU frequency and GPU power objects and QEMU's VirtIO input, shared window and Metal
@@ -335,7 +336,7 @@ sources=[ROOT/'drivers/NativeMobileDisplay/NativeLegacyDisplay.cpp',ROOT/'driver
          ROOT/'drivers/NativeHidInput/NativeHidInput.cpp',ROOT/'scripts/build-native-hid-input.py',probe_source,
          ROOT/'kits/pipa/TouchBoard.h',ROOT/'kits/pipa/SmmuBypass.h',ROOT/'drivers/NativeGeniSpi/GeniSpi.c',
          ROOT/'drivers/NativeGeniSpi/GeniSpi.h',ROOT/'drivers/NativeNovatekTouch/NvtProtocol.c',
-         ROOT/'drivers/NativeNovatekTouch/NvtProtocol.h',firmware]
+         ROOT/'drivers/NativeNovatekTouch/NvtProtocol.h',firmware,ROOT/'kits/pipa/Buttons.c',ROOT/'kits/pipa/ButtonsCore.h']
 print(run(['python3',ROOT/'scripts/build-arm-driver.py','NativeGOPPresenter'],text=True),end='')
 gop=ROOT/'build/native-gop-presenter';gop_late=gop/'NativeGOPPresenter.late.o'
 run([llvm/'llvm-objcopy','--remove-section=__DATA,__mod_init_func','--globalize-symbol=__GLOBAL__sub_I_NativeGOPPresenter.cpp',

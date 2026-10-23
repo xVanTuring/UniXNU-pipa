@@ -385,6 +385,24 @@ static void touch_strokes(void) {
     line("touch stroke: ", text);
   }
 }
+// The keys (Buttons.c, pipa-buttons=1): its row after every change of the pressed set (at most one per pass, the latest).
+extern char native_buttons_row[120] __attribute__((weak_import));
+extern volatile unsigned native_buttons_changes __attribute__((weak_import));
+extern volatile int native_buttons_error __attribute__((weak_import));
+static void buttons_status(void) {
+  static unsigned logged, error_logged;
+  if (!&native_buttons_row || !&native_buttons_changes || !&native_buttons_error) return;
+  if (native_buttons_error && !error_logged) {
+    char text[32];
+    snprintf(text, sizeof text, "stopped, error %d", native_buttons_error);
+    line("buttons: ", text);
+    error_logged = 1;
+  }
+  unsigned changes = native_buttons_changes;
+  if (changes == logged) return;
+  logged = changes;
+  touch_row("buttons: ", native_buttons_row, sizeof native_buttons_row);
+}
 
 // The lines sheng's progress page shows for other components (KeyStoreProbe.cpp writes line 0); logged with the display line.
 char boot_progress_ext[8][48];
@@ -431,6 +449,7 @@ static void writer(void *argument, int result) {
     panic_text(0);
     if (pass % 100 == 0) {display_status(); cpu_status(); touch_status();}
     if (pass % 5 == 0) touch_strokes();
+    buttons_status();
     if (restart_after && ticks() - start >= limit) {
       char text[64];
       snprintf(text, sizeof text, "%u s after the zone was mapped (pipa-restart-after)", restart_after);
