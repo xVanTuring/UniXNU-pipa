@@ -3,8 +3,9 @@
 # for the tablet to come back to fastboot by itself (package/BootRamoops.c restarts into fastboot with a warm reset 10 s after a
 # panic and pipa-restart-after seconds after boot), fetch the log with the log reader and print the kernel's own lines and the end.
 #
-# usage: scripts/kernel-round.sh [--no-build] [--twice] [--arg NAME=VALUE]... [TAIL_LINES]   (run from anywhere; UniXNU and
-#                                                                       uefi-pipa sit beside this repository)
+# usage: scripts/kernel-round.sh [--no-build | --build-only] [--twice] [--arg NAME=VALUE]... [TAIL_LINES]   (run from anywhere;
+#                                                                       UniXNU and uefi-pipa sit beside this repository)
+# --build-only stops after the boot image (no tablet needed).
 # --arg adds a kernel argument for this round only (it replaces board.toml's argument of the same name), e.g.
 # --arg sheng-data-reset=1 to start the Data overlay over.
 # --twice builds the kernel twice, for a change of pipa_defconfig or of kernel headers (the boot progress objects compile against
@@ -17,11 +18,13 @@ unixnu=$(cd "$here/../UniXNU" && pwd)
 uefi=$(cd "$here/../uefi-pipa" && pwd)
 serial=${PIPA_SERIAL:-68b7676d}
 build=1
+build_only=0
 twice=0
 extra_args=""
 while [ $# -gt 0 ]; do
   case $1 in
     --no-build) build=0; shift ;;
+    --build-only) build_only=1; shift ;;
     --twice) twice=1; shift ;;
     --arg) extra_args="$extra_args --kernel-arg $2"; shift 2 ;;
     *) break ;;
@@ -56,6 +59,10 @@ if [ $build = 1 ]; then
     echo "BUILD FAILED, see $log"
     exit 1
   fi
+fi
+if [ $build_only = 1 ]; then
+  echo "built $image ($(shasum -a 256 "$image" | cut -c1-16))"
+  exit 0
 fi
 
 fastboot devices | grep -q "^$serial" || { echo "pipa ($serial) is not in fastboot"; exit 2; }

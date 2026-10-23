@@ -228,6 +228,9 @@ kernel_args = [
   "armcpu-spi-ipi=1",
   # Ask each CPU frequency domain (EPSS) for its top level (package/BootRamoops.c): the boot core ran at about 760 MHz.
   "pipa-cpufreq=1",
+  # The touch controller (package/TouchProbe.cpp, Novatek NT36532 on QUP wrapper 0 SE4): every stage up to the point-report loop
+  # that feeds the HID input (sheng-touch-hid). Its rows go to the kernel log every 10 s; the first failing stage stops it.
+  "pipa-touch=5",
 ]
 
 [payload.adt]

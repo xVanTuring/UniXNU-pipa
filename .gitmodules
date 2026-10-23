@@ -10,3 +10,7 @@
 	path = drivers/ArmCpu
 	url = https://github.com/xVanTuring/ArmCpu.git
 	branch = pipa
+[submodule "drivers/NativeNovatekTouch"]
+	path = drivers/NativeNovatekTouch
+	url = https://github.com/xVanTuring/NativeNovatekTouch.git
+	branch = pipa

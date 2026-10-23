@@ -276,9 +276,43 @@ run([str(hid_source) if str(arg)==str(source) else str(hid_obj) if str(arg)==str
 touch_source=ROOT/'kits/pipa/TouchState.cpp'
 touch_obj=OUT/'TouchState.o'
 run([str(touch_source) if str(arg)==str(source) else str(touch_obj) if str(arg)==str(OUT/'LegacyDisplayProbe.o') else arg for arg in cmd],cwd=r['directory'])
-# The display backend, its probe, the key store and the HID input: UniXNU-tb128fu's touch controller, GPU, RPM and USB log
-# probes, sheng's touch panel, CPU frequency and GPU power objects and QEMU's VirtIO input, shared window and Metal accelerator
-# stay out (they drive other hardware).
+# The touch controller (TouchProbe.cpp, pipa-touch=<stage>): the board probe with the kernel's C++ flags; the generic GENI SPI
+# library, the Novatek protocol (drivers/NativeNovatekTouch, pipa branch) and the firmware object with the kernel's C flags. The
+# firmware is novatek_nt36532_m82_fw_tm.bin of the tablet's stock kernel (its built-in firmware table; the panel is the "36" one,
+# whose maker 0x36 the DT pairs with the _tm image), kept outside Git in the board's .cache/firmware/touch (PIPA_TOUCH_FIRMWARE
+# overrides it).
+touch_dir=OUT/'touch';touch_dir.mkdir(exist_ok=True)
+touch_includes=['-I',str(ROOT/'kits/pipa'),'-I',str(ROOT/'drivers/NativeGeniSpi'),'-I',str(ROOT/'drivers/NativeNovatekTouch')]
+probe_source=ROOT/'kits/pipa/TouchProbe.cpp';probe_obj=touch_dir/'TouchProbe.o'
+run([str(probe_source) if str(arg)==str(source) else str(probe_obj) if str(arg)==str(OUT/'LegacyDisplayProbe.o') else arg for arg in cmd]+touch_includes,
+    cwd=r['directory'])
+firmware=Path(os.environ.get('PIPA_TOUCH_FIRMWARE') or ROOT/'.cache/firmware/touch/novatek_nt36532_m82_fw_tm.bin')
+require(firmware.is_file(),f'Missing the touch firmware {firmware} (from the stock kernel\'s built-in firmware table)')
+blob=firmware.read_bytes()
+require(len(blob)>4096 and (blob[-4096]+blob[-4095])&0xff==0xff,f'{firmware} fails the version check of the vendor driver')
+firmware_c=touch_dir/'NovatekFirmware.c'
+firmware_c.write_text(f'// {firmware.name}, sha256 {hashlib.sha256(blob).hexdigest()}\n#include <stdint.h>\n'
+                      'const uint8_t native_touch_firmware[] __attribute__((aligned(16))) = {'+','.join(map(str,blob))+'};\n'
+                      f'const uint32_t native_touch_firmware_size = {len(blob)};\n')
+c_record=json.loads((ROOT/'build/xnu/ios-obj/DEVELOPMENT_ARM64_BCM2837/osfmk/DEVELOPMENT/startup.o.json').read_text().strip().rstrip(','))
+def c_compile(c_source,c_obj):
+    out=[];a=c_record['arguments'];j=0
+    while j<len(a):
+        value=a[j]
+        if value==c_record['file']:out.append(str(c_source))
+        elif value in ('-o','-MF','-MT','-MJ'):
+            if value=='-o':out+=['-o',str(c_obj)]
+            j+=1
+        elif value=='-Xclang' and a[j+1].startswith('-W'):j+=1
+        elif not value.startswith('-W'):out.append(value)
+        j+=1
+    run(out+['-Wall','-Wextra','-Werror']+touch_includes,cwd=c_record['directory'])
+touch_objs=[probe_obj]
+for c_source in (ROOT/'drivers/NativeGeniSpi/GeniSpi.c',ROOT/'drivers/NativeNovatekTouch/NvtProtocol.c',firmware_c):
+    c_obj=touch_dir/(c_source.stem+'.o');c_compile(c_source,c_obj);touch_objs.append(c_obj)
+# The display backend, its probe, the key store, the HID input and the touch controller: UniXNU-tb128fu's Himax touch, GPU, RPM and
+# USB log probes, sheng's touch panel (THP), CPU frequency and GPU power objects and QEMU's VirtIO input, shared window and Metal
+# accelerator stay out (they drive other hardware).
 archive=OUT/'libNativeLegacyDisplay.late.a';archive.unlink(missing_ok=True)
 kernel=ROOT.parent/'kernel/kernel.macho'
 reference=ROOT/'build/native-prelink/native-owner-ufs-cpu-desktop-pipa-candidate.macho'
@@ -295,10 +329,13 @@ run([llvm/'llvm-objcopy','--remove-section=__DATA,__mod_init_func',
 require(code((keyevents/'NativeKeyStoreEvents.o').read_bytes(),macho((keyevents/'NativeKeyStoreEvents.o').read_bytes()))==
         code(keyevents_late.read_bytes(),macho(keyevents_late.read_bytes())),'Owned event-service instructions unchanged by late init staging')
 run(['xcrun','ar','rcs',archive,late,OUT/'original-bindings.o',OUT/'LegacyDisplayProbe.o',keystore_obj,keyevents_late,
-     hid_obj,touch_obj,hid_dir/'NativeHidInput.late.o',hid_dir/'hid-original-bindings.o'])
+     hid_obj,touch_obj,hid_dir/'NativeHidInput.late.o',hid_dir/'hid-original-bindings.o',*touch_objs])
 sources=[ROOT/'drivers/NativeMobileDisplay/NativeLegacyDisplay.cpp',ROOT/'drivers/NativeMobileDisplay/NativeLegacyRequest.h',source,
          keystore_source,ROOT/'drivers/NativeKeyStoreEvents/NativeKeyStoreEvents.cpp',hid_source,touch_source,
-         ROOT/'drivers/NativeHidInput/NativeHidInput.cpp',ROOT/'scripts/build-native-hid-input.py']
+         ROOT/'drivers/NativeHidInput/NativeHidInput.cpp',ROOT/'scripts/build-native-hid-input.py',probe_source,
+         ROOT/'kits/pipa/TouchBoard.h',ROOT/'kits/pipa/SmmuBypass.h',ROOT/'drivers/NativeGeniSpi/GeniSpi.c',
+         ROOT/'drivers/NativeGeniSpi/GeniSpi.h',ROOT/'drivers/NativeNovatekTouch/NvtProtocol.c',
+         ROOT/'drivers/NativeNovatekTouch/NvtProtocol.h',firmware]
 print(run(['python3',ROOT/'scripts/build-arm-driver.py','NativeGOPPresenter'],text=True),end='')
 gop=ROOT/'build/native-gop-presenter';gop_late=gop/'NativeGOPPresenter.late.o'
 run([llvm/'llvm-objcopy','--remove-section=__DATA,__mod_init_func','--globalize-symbol=__GLOBAL__sub_I_NativeGOPPresenter.cpp',

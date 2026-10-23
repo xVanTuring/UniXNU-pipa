@@ -348,6 +348,44 @@ static void cpu_status(void) {
   line("cpus: ", text);
 }
 
+// The touch controller (TouchProbe.cpp, pipa-touch=<stage>): its status rows (stages, clocks and pins, chip id and firmware info,
+// transfer errors), the trace rows that matter once it runs (reports, download, SPI modes), and every finished stroke
+// {start ms, ms, x0, y0, x1, y1, reports} with the extent all contacts reached (HID units), for the axis check.
+extern volatile unsigned native_touch_stage_req __attribute__((weak_import));
+extern char native_touch_rows[4][120] __attribute__((weak_import));
+extern char native_touch_trace[8][120] __attribute__((weak_import));
+extern volatile int native_touch_strokes[16][7] __attribute__((weak_import));
+extern volatile unsigned native_touch_stroke_count __attribute__((weak_import));
+extern volatile int native_touch_extent[4] __attribute__((weak_import));
+static void touch_row(const char *prefix, const char *row, unsigned cap) {
+  char text[128];
+  unsigned n = 0;
+  for (; n < cap && n < sizeof text - 1 && row[n]; ++n) text[n] = row[n];
+  text[n] = 0;
+  if (n) line(prefix, text);
+}
+static void touch_status(void) {
+  if (!&native_touch_stage_req || !&native_touch_rows || !&native_touch_trace || !native_touch_stage_req) return;
+  for (unsigned i = 0; i < 4; ++i) touch_row("touch: ", native_touch_rows[i], sizeof native_touch_rows[i]);
+  static const unsigned traces[] = {3, 4, 7, 0, 2};
+  for (unsigned i = 0; i < sizeof traces / sizeof traces[0]; ++i)
+    touch_row("touch: ", native_touch_trace[traces[i]], sizeof native_touch_trace[traces[i]]);
+}
+static void touch_strokes(void) {
+  static unsigned logged;
+  if (!&native_touch_strokes || !&native_touch_stroke_count || !&native_touch_extent) return;
+  unsigned count = native_touch_stroke_count;
+  if (count - logged > 16) logged = count - 16;
+  for (; logged < count; ++logged) {
+    volatile int *r = native_touch_strokes[logged & 15];
+    char text[160];
+    snprintf(text, sizeof text, "#%u at %d ms for %d ms (%d,%d) -> (%d,%d) %d reports, extent x %d..%d y %d..%d", logged, r[0], r[1],
+             r[2], r[3], r[4], r[5], r[6], native_touch_extent[0], native_touch_extent[1], native_touch_extent[2],
+             native_touch_extent[3]);
+    line("touch stroke: ", text);
+  }
+}
+
 // The lines sheng's progress page shows for other components (KeyStoreProbe.cpp writes line 0); logged with the display line.
 char boot_progress_ext[8][48];
 
@@ -391,7 +429,8 @@ static void writer(void *argument, int result) {
   for (u32 pass = 1;; ++pass) {
     messages();
     panic_text(0);
-    if (pass % 100 == 0) {display_status(); cpu_status();}
+    if (pass % 100 == 0) {display_status(); cpu_status(); touch_status();}
+    if (pass % 5 == 0) touch_strokes();
     if (restart_after && ticks() - start >= limit) {
       char text[64];
       snprintf(text, sizeof text, "%u s after the zone was mapped (pipa-restart-after)", restart_after);

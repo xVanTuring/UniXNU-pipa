@@ -62,9 +62,9 @@ fastboot boot out/pipa/boot/boot.img
 
 ## Stage 4 to 7: kernel, root, iPadOS and the lock screen
 
-State on 2026-10-23: iPadOS 17.7.11 runs to the lock screen on all eight cores at their top clocks, from the UFS root, with the display on the firmware frame buffer (QuartzCore's CPU renderer). No touch, GPU, audio or network yet.
+State on 2026-10-23: iPadOS 17.7.11 runs to the lock screen on all eight cores at their top clocks, from the UFS root, with the display on the firmware frame buffer (QuartzCore's CPU renderer). No touch, GPU, audio or network yet. The touch driver (below) is written and builds, but has not run on the tablet.
 
-One round is one command, with no keys: `scripts/kernel-round.sh [--no-build] [--twice] [--arg NAME=VALUE]... [TAIL_LINES]` builds the kernel, payload and boot image against the local IPSW, `fastboot boot`s it, waits until the kernel restarts the tablet into fastboot by itself (a warm reset that keeps the ramoops log: 10 s after a panic, after the third SpringBoard/backboardd crash, or 240 s after boot), reads the log back and prints the kernel's own lines (display, cores, CPU levels, crashes) and the end. `--twice` after a change of `pipa_defconfig`; `--arg sheng-data-reset=1` once after a change that MobileGestalt caches in the Data overlay (the UI scale).
+One round is one command, with no keys: `scripts/kernel-round.sh [--no-build | --build-only] [--twice] [--arg NAME=VALUE]... [TAIL_LINES]` builds the kernel, payload and boot image against the local IPSW, `fastboot boot`s it, waits until the kernel restarts the tablet into fastboot by itself (a warm reset that keeps the ramoops log: 10 s after a panic, after the third SpringBoard/backboardd crash, or 240 s after boot), reads the log back and prints the kernel's own lines (display, cores, CPU levels, crashes) and the end. `--twice` after a change of `pipa_defconfig`; `--arg sheng-data-reset=1` once after a change that MobileGestalt caches in the Data overlay (the UI scale).
 
 What makes it up (see `configs/pipa_defconfig` and `board.toml` for every switch and argument):
 
@@ -74,6 +74,7 @@ What makes it up (see `configs/pipa_defconfig` and `board.toml` for every switch
 - The display stack of UniXNU-tb128fu without its GPU and touch probes (`drivers/NativeMobileDisplay` branch `pipa`, `package/LegacyDisplayProbe.cpp` and the key store and HID probes), at UI scale 2 (900x1440 points).
 - `drivers/ArmCpu` (branch `pipa`): all eight cores, IPIs as SPIs at the distributor's top eight INTIDs (952..959).
 - `package/BootFaultProbe.c` and `BootWatchdogPolicy.c` of UniXNU-tb128fu: crash records and the launchd job policy.
+- Touch, not yet run on the tablet: `package/TouchProbe.cpp` (`pipa-touch=<stage>`, 5 in `board.toml`) drives the Novatek NT36532 through UniXNU's `drivers/NativeGeniSpi` and `drivers/NativeNovatekTouch` (branch `pipa`: the point reports of this firmware). Stages: 1 a read-only snapshot of clocks and pins, 2 the QUP wrapper 0 clocks and the SPI pins, 3 the GENI SPI engine, a loopback test and the chip id, 4 the firmware download and its info block, 5 the report loop on the attention line (TLMM 39, latched without an interrupt), publishing to the HID input. The board facts and their sources are in `package/TouchBoard.h` (host test `package/TouchBoardTests.c`). The firmware is `novatek_nt36532_m82_fw_tm.bin` from the stock kernel's built-in firmware table (the panel's maker 0x36 pairs with the `_tm` image), kept in `.cache/firmware/touch` outside Git. The kernel log shows the touch rows every 10 s and each finished stroke with its start and end points, for checking the axes; Android's range 0..17999 x 0..28799 cannot come from the firmware's 12-bit coordinates directly, so the stock driver presumably scales by ten; this driver scales by the firmware's own maximum from its info block.
 
 Inputs kept outside Git in UniXNU's `out/pipa/tree` (copy them again after a tree is wiped): `build/storage-abi/interface-audit.json` and `build/verified-root-os/trusted-key.bin` from `out/tb128fu/tree`, and an empty `build/xnu/ios-obj/EXPORT_HDRS/libsa`.
 
@@ -125,7 +126,7 @@ Read under Android 14 (HyperOS 2.0.20) with `android-devinfo` on 2026-10-21; the
 
 ## Next steps
 
-1. Touch: Novatek NT36532 over GENI SPI (0x990000, TLMM 39) with SM8250 QUP, GCC and TLMM constants (`TouchBoard.h` of sheng and UniXNU-tb128fu's `TouchProbe.cpp` are the templates).
+1. Touch on the tablet: the stages of `pipa-touch` in order (chip id, download, reports), then the axes from the logged strokes. If the engine's FIFO is disabled (stage 2's `if` value), transfers go through its DMA with an SMMU pass-through for stream 0x5a3.
 2. Display: the CPU copy to the firmware frame buffer has no vertical sync (tearing, as on UniXNU-tb128fu); later the DSI/MDSS path or a GPU copy.
 3. GPU: Adreno 650 needs its own GMU, HFI and PM4 work (UniXNU-tb128fu's A610 has no GMU).
 4. A UFS log beside the ramoops zone, for resets that do not keep memory.

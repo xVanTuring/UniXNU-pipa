@@ -483,11 +483,14 @@ void native_legacy_display_probe(void) {
 void native_legacy_display_late_probe(void);
 extern void native_hid_input_probe(void);
 extern void native_keystore_probe(void);
-// pipa: the key store stand-in and the HID input only. sheng's CPU frequency and GPU power probes and UniXNU-tb128fu's touch,
-// GPU and USB log probes drive other hardware and are not in this board's archive.
+extern void native_touch_probe(void);
+// pipa: the key store stand-in, the HID input and the touch controller (TouchProbe.cpp, Novatek NT36532, pipa-touch=<stage>,
+// default off). sheng's CPU frequency and GPU power probes and UniXNU-tb128fu's GPU and USB log probes drive other hardware and
+// are not in this board's archive.
 void native_legacy_display_late_probe(void) {
     native_keystore_probe();
     native_hid_input_probe();
+    native_touch_probe();
     IOService *display=pendingLegacyDisplay;if(!display)return;pendingLegacyDisplay=nullptr;
     native_legacy_surface_status=OSKextLoadKextWithIdentifier("com.apple.iokit.IOSurface");
     OSDictionary *matching=IOService::nameMatching("IOCoreSurfaceRoot");
