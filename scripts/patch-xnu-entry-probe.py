@@ -198,6 +198,12 @@ def assemble_c(source, va, workdir, symbols):
         if not any(base <= text and text + 256 <= base + size for base, size, _, _ in SEGMENTS):
             raise SystemExit('Invalid _boot_progress_panic_text')
         definitions.append(f'-DPANIC_TEXT={text:#x}UL')
+    # Optional: the board's hook called once the panic is on the screen (pipa: package/BootRamoops.c, the log and the restart).
+    hook = symbols.get('_boot_progress_panic_hook')
+    if hook is not None:
+        if hook % 4 or not any(base <= hook < base + size for base, size, _, _ in SEGMENTS):
+            raise SystemExit('Invalid _boot_progress_panic_hook')
+        definitions.append(f'-DPANIC_HOOK={hook:#x}UL')
     subprocess.run([clang, '--target=aarch64-none-elf', '-ffreestanding', '-fno-builtin', '-fno-stack-protector',
                     '-mgeneral-regs-only', '-fno-pic', '-mcmodel=tiny', '-Oz', f'-DVINFO={VINFO_VA:#x}UL',
                     *definitions, f'-I{font_dir}', '-c', source, '-o', obj], check=True)

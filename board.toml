@@ -46,6 +46,8 @@ archives = [
   "build-arm-driver.py ArmDTPlatform",
   "build-arm-driver.py ArmCpu",
   "build-arm-driver.py NativeAES",
+  # drivers/NativeUfs (the pipa branch): the SM8250 host, controller probes only for now (no block device or root).
+  "build-arm-driver.py NativeUfs --sm8250 --probe-only",
   "build-native-aes-bindings.py",
   "build-libpthread-kernel.py",
   "build-link-stubs.py",
@@ -162,6 +164,12 @@ kernel_args = [
   "sheng-pmgr=2",
   "-no_slto_panic",
   "ml-timeout-lock-panic-scale=40",
+  # NativeUfs survey of the SM8250 UFS (clocks, controller, SMMU) into the kernel log, then the read-only GPT check
+  # (bring-up, LUN 0 GPT, userdata's first block), which ends in a panic with its result.
+  "native-ufs-probe=16",
+  # The kernel restarts into fastboot by itself with a warm reset that keeps the ramoops log (package/BootRamoops.c): 300 s
+  # after the log zone is mapped, and 10 s (the default of pipa-panic-restart-after) after a panic.
+  "pipa-restart-after=300",
 ]
 
 [payload.adt]

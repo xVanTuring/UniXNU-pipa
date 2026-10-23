@@ -38,6 +38,11 @@ struct ctx {
 #ifndef PANIC_TEXT
 #define PANIC_TEXT 0UL
 #endif
+/* The board's hook, called once the first panic is on the screen (pipa: BootRamoops.c boot_progress_panic_hook, the log and
+ * the restart into fastboot); 0 = none. */
+#ifndef PANIC_HOOK
+#define PANIC_HOOK 0UL
+#endif
 #define PANIC_TEXT_BYTES 256
 
 __attribute__((noreturn)) static void park (void)
@@ -272,6 +277,9 @@ __attribute__((noreturn, used, section(".text.b_main"))) void panic_screen_main 
   mark[0] = 0xC0FFEE11u;
   mark[1] = 0x5CEEDA7Au;
   __asm__ volatile ("dsb sy");
+  if (PANIC_HOOK) {
+    ((void (*)(void))PANIC_HOOK) ();
+  }
   park ();
 }
 

@@ -11,9 +11,24 @@ parser = argparse.ArgumentParser(description=__doc__)
 parser.add_argument('component', choices=['ArmVirtPlatform', 'ArmDTPlatform', 'ArmCpu', 'NativeAES', 'NativeVirtioBlock', 'NativeRamBlock', 'NativeMobileDisplay', 'NativeVirtioConsole', 'NativeLegacyDisplay', 'NativeGOPPresenter', 'NativeOfflineGPU', 'NativeOfflineAccelerator', 'NativeIOGPUProviderProbe', 'NativeUfs', 'NativeHidInput', 'NativeKeyStoreEvents', 'NativeAdreno'])
 parser.add_argument('--negative-aes-kat', action='store_true', help='Isolated own-source wrong-answer refusal control; never changes original inputs')
 parser.add_argument('--verified-root', action='store_true', help='Authenticate all actual disk reads against an independently signed immutable policy')
+parser.add_argument('--verified-root-in-place', action='store_true', help='Add verified-root code but keep the standard output directory (for the bindings/kernel archive path)')
 parser.add_argument('--verified-root-bundle', action='store_true', help='Select exactly one capacity-matching policy per device, then independently authenticate it')
 parser.add_argument('--negative-verified-block', action='store_true', help='Negative own-buffer control: corrupt only the completed DMA snapshot')
+parser.add_argument('--sm6225', action='store_true', help='Select the SM6225 bengal UFS host/GCC/SMMU constants of NativeUfs')
+parser.add_argument('--sm8250', action='store_true', help='Select the SM8250 kona UFS host/GCC/SMMU constants of NativeUfs')
+parser.add_argument('--probe-only', action='store_true', help='NativeUfs controller probes/adopt only; omit the block device and root publication')
+parser.add_argument('--no-verified-block', action='store_true', help='NativeUfs block device without the VerifiedRoot owner policies (link experiment)')
 args = parser.parse_args()
+if (args.sm6225 or args.sm8250) and args.component != 'NativeUfs':
+    parser.error('--sm6225 and --sm8250 select the NativeUfs platform constants')
+if args.sm6225 and args.sm8250:
+    parser.error('--sm6225 and --sm8250 are mutually exclusive')
+if args.probe_only and args.component != 'NativeUfs':
+    parser.error('--probe-only selects the NativeUfs probe variant')
+if args.no_verified_block and args.component != 'NativeUfs':
+    parser.error('--no-verified-block selects the NativeUfs block variant')
+if args.probe_only and args.no_verified_block:
+    parser.error('--probe-only and --no-verified-block are mutually exclusive')
 if args.verified_root_bundle and not args.verified_root:
     parser.error('A policy bundle requires verified block mode')
 if args.verified_root_bundle and args.negative_verified_block:
@@ -22,6 +37,8 @@ if (args.verified_root or args.negative_verified_block) and args.component != 'N
     parser.error('Verified block mode requires the concrete read-only block transport')
 if args.negative_verified_block and not args.verified_root:
     parser.error('The isolated input fault requires verified block mode')
+if args.verified_root_in_place and not args.verified_root:
+    parser.error('--verified-root-in-place requires --verified-root')
 component = args.component
 recipe = ROOT / 'build/xnu/ios-obj/DEVELOPMENT_ARM64_BCM2837/iokit/DEVELOPMENT/IOPlatformExpert.cpo.json'
 record = json.loads(recipe.read_text().strip().rstrip(','))
@@ -30,7 +47,7 @@ out = ROOT / 'build' / {'ArmVirtPlatform': 'armvirt-platform', 'ArmDTPlatform': 
                         'NativeVirtioBlock': 'native-virtio-block', 'NativeRamBlock': 'native-ram-block',
                         'NativeMobileDisplay': 'native-mobile-display', 'NativeVirtioConsole': 'native-virtio-console',
                         'NativeLegacyDisplay': 'native-legacy-display', 'NativeGOPPresenter': 'native-gop-presenter', 'NativeOfflineGPU':'native-offline-gpu','NativeOfflineAccelerator':'native-offline-accelerator','NativeIOGPUProviderProbe':'native-original-provider', 'NativeUfs':'native-ufs', 'NativeHidInput':'native-hid-input', 'NativeKeyStoreEvents':'native-keystore-events', 'NativeAdreno':'native-adreno'}[component]
-if args.verified_root:
+if args.verified_root and not args.verified_root_in_place:
     out = ROOT / ('build/native-virtio-block-verified-fault' if args.negative_verified_block else 'build/native-virtio-block-verified')
     if args.verified_root_bundle:
         out = ROOT / 'build/native-virtio-block-verified-bundle'
@@ -76,7 +93,15 @@ if component in ('NativeVirtioBlock', 'NativeRamBlock', 'NativeUfs'):
         command += ['-DNATIVE_VERIFIED_BLOCK_MULTI_POLICY=1']
 if component == 'NativeUfs':
     command += ['-I', str(ROOT / 'kits/VerifiedRoot/include'), '-I', str(ROOT / 'drivers/NativeVirtioBlock'),
-                '-DNATIVE_VERIFIED_BLOCK=1', '-DNATIVE_VERIFIED_BLOCK_MULTI_POLICY=1', '-mgeneral-regs-only']
+                '-mgeneral-regs-only']
+    if args.probe_only:
+        command += ['-DNATIVE_UFS_PROBE_ONLY=1']
+    elif not args.no_verified_block:
+        command += ['-DNATIVE_VERIFIED_BLOCK=1', '-DNATIVE_VERIFIED_BLOCK_MULTI_POLICY=1']
+    if args.sm6225:
+        command += ['-DNATIVE_UFS_SM6225=1']
+    if args.sm8250:
+        command += ['-DNATIVE_UFS_SM8250=1']
 if component=='NativeOfflineGPU':
     command += ['-I',str(ROOT/'drivers/NativeVirtioConsole')]
 if component in ('NativeLegacyDisplay','NativeHidInput'):
