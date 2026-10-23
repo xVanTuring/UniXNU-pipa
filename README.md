@@ -60,9 +60,26 @@ fastboot boot out/pipa/boot/boot.img
 
 `fastboot boot` writes nothing to the tablet. Expected: the Mu-Silicium boot log, then the UniXNU menu with its built-in configuration. A firmware stall leaves the tablet in the bootloader; start the same image again.
 
-## Stage 4 and 5: kernel entry
+## Stage 4 to 7: kernel, root, iPadOS and the lock screen
 
-`configs/pipa_defconfig` builds the generic kernel path only: CPU, GIC, timer, the device-tree platform expert, the source corecrypto and pthread providers and NativeAES. Storage, Data, display and the owner root chain stay out until their inputs exist (see the file).
+State on 2026-10-23: iPadOS 17.7.11 runs to the lock screen on all eight cores at their top clocks, from the UFS root, with the display on the firmware frame buffer (QuartzCore's CPU renderer). No touch, GPU, audio or network yet.
+
+One round is one command, with no keys: `scripts/kernel-round.sh [--no-build] [--twice] [--arg NAME=VALUE]... [TAIL_LINES]` builds the kernel, payload and boot image against the local IPSW, `fastboot boot`s it, waits until the kernel restarts the tablet into fastboot by itself (a warm reset that keeps the ramoops log: 10 s after a panic, after the third SpringBoard/backboardd crash, or 240 s after boot), reads the log back and prints the kernel's own lines (display, cores, CPU levels, crashes) and the end. `--twice` after a change of `pipa_defconfig`; `--arg sheng-data-reset=1` once after a change that MobileGestalt caches in the Data overlay (the UI scale).
+
+What makes it up (see `configs/pipa_defconfig` and `board.toml` for every switch and argument):
+
+- `package/BootRamoops.c`: the kernel log in the stock ramoops console zone (stages, process events, exits and crash lines, the message buffer every 100 ms, display and core counters every 10 s), the restart into fastboot (uefi-pipa's RamoopsLogLib sequence), the panic hook the panic screen calls, and `pipa-cpufreq=1` (the EPSS domains to their top levels).
+- `drivers/NativeUfs` (branch `pipa`): the SM8250 host, keeping UEFI's SMMU pass-through for streams 0xe0/0x4e0; `native-ufs-probe=16` surveys it without the root.
+- userdata: UniXNU-tb128fu's root image (`out/tb128fu/userdata/userdata-root.sparse.img`, the same IPSW and owner key), flashed with `fastboot flash userdata`; the owner root chain, Data seed and trust caches as on UniXNU-tb128fu.
+- The display stack of UniXNU-tb128fu without its GPU and touch probes (`drivers/NativeMobileDisplay` branch `pipa`, `package/LegacyDisplayProbe.cpp` and the key store and HID probes), at UI scale 2 (900x1440 points).
+- `drivers/ArmCpu` (branch `pipa`): all eight cores, IPIs as SPIs at the distributor's top eight INTIDs (952..959).
+- `package/BootFaultProbe.c` and `BootWatchdogPolicy.c` of UniXNU-tb128fu: crash records and the launchd job policy.
+
+Inputs kept outside Git in UniXNU's `out/pipa/tree` (copy them again after a tree is wiped): `build/storage-abi/interface-audit.json` and `build/verified-root-os/trusted-key.bin` from `out/tb128fu/tree`, and an empty `build/xnu/ios-obj/EXPORT_HDRS/libsa`.
+
+The first kernel (2026-10-23, before storage) is described below.
+
+`configs/pipa_defconfig` then built the generic kernel path only: CPU, GIC, timer, the device-tree platform expert, the source corecrypto and pthread providers and NativeAES.
 
 A first kernel build from a clean tree needs the bootstrap pass of [UniXNU#5](https://github.com/UniXNU/UniXNU/pull/5) ([UniXNU#4](https://github.com/UniXNU/UniXNU/issues/4)), which UniXNU's main has.
 
@@ -104,14 +121,14 @@ Read under Android 14 (HyperOS 2.0.20) with `android-devinfo` on 2026-10-21; the
 - **Firmware volume size.** The vendor drivers are 4.8 MiB before compression and the FD is 3 MiB. If UniXNU does not fit, the EDK II build stops. Then either drop vendor drivers that UniXNU does not need (USB, charger) the way sheng's `SHENG_VENDOR_HW = 0` does, or grow the FD into the 576 KiB gap below the UEFI stack (`pipa.toml` and the "UEFI FD" descriptor together).
 - **Vendor drivers and the panel.** On sheng the vendor clock stack blanked the panel; upstream reports a working display on pipa, but not together with UniXNU.
 - **ABL acceptance** of a 192 MiB ramdisk in a header v1 image is unverified on pipa; the stock boot image is header v3.
-- **userdata.** A later root image is written with `fastboot flash userdata`, which erases Android's data partition.
+- **userdata.** The root image is written with `fastboot flash userdata`, which erases Android's data partition (done on 2026-10-23; the full backup restores Android).
 
 ## Next steps
 
-1. NativeUfs for SM8250: the compatible, GCC offsets from `gcc-sm8250.c`, SMMU stream 0x0e0, the DMA window.
-2. Touch: NT36532 over GENI SPI with SM8250 QUP, GCC and TLMM constants (`TouchBoard.h` of sheng is the template).
-3. Display, Data and boot progress: the legacy display archive and the boot progress page live in UniXNU-sheng's package together with sheng board probes; they need separating, and the boot progress page needs the owner root chain.
-4. GPU: Adreno 650 needs its own GMU, HFI and PM4 work.
+1. Touch: Novatek NT36532 over GENI SPI (0x990000, TLMM 39) with SM8250 QUP, GCC and TLMM constants (`TouchBoard.h` of sheng and UniXNU-tb128fu's `TouchProbe.cpp` are the templates).
+2. Display: the CPU copy to the firmware frame buffer has no vertical sync (tearing, as on UniXNU-tb128fu); later the DSI/MDSS path or a GPU copy.
+3. GPU: Adreno 650 needs its own GMU, HFI and PM4 work (UniXNU-tb128fu's A610 has no GMU).
+4. A UFS log beside the ramoops zone, for resets that do not keep memory.
 
 ## License
 
