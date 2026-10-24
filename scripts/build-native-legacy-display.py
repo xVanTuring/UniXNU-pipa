@@ -302,9 +302,11 @@ gmu_c=touch_dir/'GmuFirmware.c'
 gmu_c.write_text(f'// {gmu_firmware.name}, sha256 {hashlib.sha256(gmu_blob).hexdigest()}\n#include <stdint.h>\n'
                  'const uint8_t native_gpu_gmu_firmware[] __attribute__((aligned(16))) = {'+','.join(map(str,gmu_blob))+'};\n'
                  f'const uint32_t native_gpu_gmu_firmware_size = {len(gmu_blob)};\n')
-# The CP's SQE microcode, a650_sqe.fw of the same vendor directory (PIPA_SQE_FIRMWARE overrides it).
-sqe_firmware=Path(os.environ.get('PIPA_SQE_FIRMWARE') or ROOT/'.cache/firmware/gpu/a650_sqe.fw')
-require(sqe_firmware.is_file(),f'Missing the SQE firmware {sqe_firmware} (the vendor partition\'s /firmware/a650_sqe.fw)')
+# The CP's SQE microcode: linux-firmware's qcom/a650_sqe.fw (version 0x112), kept outside Git in .cache/firmware/linux-firmware
+# (PIPA_SQE_FIRMWARE overrides it). The vendor partition's a650_sqe.fw is version 0x093, which Linux refuses (a650 SQE older
+# than 0x095 lacks security fixes, a6xx_ucode_check_version).
+sqe_firmware=Path(os.environ.get('PIPA_SQE_FIRMWARE') or ROOT/'.cache/firmware/linux-firmware/a650_sqe.fw')
+require(sqe_firmware.is_file(),f'Missing the SQE firmware {sqe_firmware} (linux-firmware\'s qcom/a650_sqe.fw from git.kernel.org)')
 sqe_blob=sqe_firmware.read_bytes()
 require(len(sqe_blob)>=8 and len(sqe_blob)%4==0,f'{sqe_firmware} is not an SQE image')
 sqe_c=touch_dir/'SqeFirmware.c'

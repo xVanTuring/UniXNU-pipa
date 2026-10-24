@@ -19,7 +19,7 @@
 //      with GX on the GX GDSC, RBBM_STATUS and both GBIF halt registers, read only.
 //   9  as 8, then, with GX on, the first GPU command, after UniXNU-tb128fu's GPU probe mode 7 (naContext, naHwInit, naCp): the
 //      GPU's own SMMU context through NativeAdreno (bank 0 / ASID 2, the GPU's streams 0, 1, 0x400 and 0x401 of its DT iommus
-//      <0 0x401> on SMR 0, 1, 4 and 5; non-coherent table walks), Linux v6.6 hw_init for the A650 (no clock gating, no APRIV),
+//      <0 0x401> on SMR 0, 1, 4 and 5; non-coherent table walks), Linux v6.6 hw_init for the A650 (clock gating and APRIV),
 //      the SQE (a650_sqe.fw without its first dword), ring 0 with CP_RB_CNTL NO_UPDATE, CP_ME_INIT, then one CP_MEM_WRITE of
 //      a marker into the scratch page that the CPU reads back.
 //  10  as 9, then the zap shader (a650_zap.elf of the vendor partition through PAS 13 into the DT's pil_gpu_region@8681a000:
@@ -32,8 +32,8 @@
 //  12  as 11, then the staged accelerator for the original Metal discovery (UniXNU-sheng's publishMetal, UniXNU-tb128fu's
 //      naMetal); the Metal plugin and Turnip come from the GPU addon (sheng-gpu-addon=1) and the owner trust module.
 // The rows below go to the kernel log whenever they change (BootRamoops.c). The sequence starts 5 s after the late probe, so the
-// display and the log thread already run if a read hangs the bus. Modes 1-12 ran on the tablet on 2026-10-24; with 12 the frames are
-// all zero (every UCHE read ends in UCHE_OOB_ACCESS, see the README).
+// display and the log thread already run if a read hangs the bus. Modes 1-12 ran on the tablet on 2026-10-24; until APRIV was set
+// every UCHE read ended in UCHE_OOB_ACCESS and Metal's frames were all zero (see the README).
 #include <IOKit/IOService.h>
 #include <IOKit/IOLib.h>
 #include <IOKit/IOMemoryDescriptor.h>
@@ -533,7 +533,7 @@ void setHwcg() {
 }
 
 // hw_init of Linux v6.6 a6xx_gpu.c for the A650 (a650 family, with a GMU); register offsets from a6xx.xml / a6xx_gmu.xml.
-// Hardware clock gating as Linux (setHwcg); APRIV is not enabled (the ring uses NO_UPDATE as on the A610).
+// Hardware clock gating as Linux (setHwcg), and APRIV (pipa-gpu-apriv=0 leaves it off; the ring uses NO_UPDATE either way).
 void hwInit() {
     gw(0x3C45, 0); (void)gpuRead(0x3C45);                               // GBIF_HALT
     gw(0x0016, 0); (void)gpuRead(0x0016);                               // RBBM_GBIF_HALT
@@ -581,6 +581,13 @@ void hwInit() {
     gw(0x84F, (1u << 0) | (1u << 1) | (1u << 3));                       // CP_PROTECT_CNTL
     for (unsigned i = 0; i + 1 < kProtectCount; ++i) gw(0x850 + i, kProtect[i]);
     gw(0x850 + 47, kProtect[kProtectCount - 1]);                        // CP_PROTECT(47)
+    // CP_APRIV_CNTL as Linux on the A650 (hw_apriv): the CP's own instruction, ring and rptr accesses as privileged. Without it
+    // (2026-10-24) every read of the shaders and the texture pipe ended in UCHE_OOB_ACCESS: Turnip's check filled a buffer (no
+    // read) but its compute shader wrote nothing and its image copy nothing ("T s0 r0 v512 c0 g0/4096"), and Metal's frames were
+    // all zero; with it (and linux-firmware's SQE) the same check passed ("T s0 r0 v1024 c1024 g512/0").
+    unsigned apriv = 1;
+    PE_parse_boot_argn("pipa-gpu-apriv", &apriv, sizeof apriv);
+    if (apriv) gw(0x844, (1u << 6) | (1u << 5) | (1u << 3) | (1u << 2) | (1u << 1));
     gw(0x038, NativeAdrenoIrq::maskA6xx());                             // RBBM_INT_0_MASK: A6XX_INT_MASK
 }
 
@@ -598,6 +605,23 @@ void ucheRow() {
         strlcpy(native_gpu_rows[kRowUche], line, sizeof native_gpu_rows[0]);
         changed();
     }
+}
+
+// Register blocks as kernel log lines ("gpu regs <when> <first register>: eight values"), to compare the state after the secure exit
+// with the state at the first UCHE_OOB_ACCESS: the UCHE (0xE00..0xE3F; the A5XX's UCHE logs the address of an out-of-bounds access
+// in its TRAP_LOG registers, the A6XX's are not documented), RBBM status and interrupts, CP_ADDR_MODE and CP_APRIV, the GBIF (system
+// cache IDs, QSB sides, halt), the first registers of SP, TPL1 and HLSQ, the TSB registers hw_init writes, and last
+// RBBM_SECVID_TRUST_CNTL (0xF400), which Linux writes only when there is no zap shader and which may be closed to this side.
+void regDump(const char *when) {
+    static const uint32_t kBlocks[][2] = {{0xE00, 64}, {0x200, 24}, {0x840, 8}, {0x3C00, 8}, {0x3C40, 8}, {0xAE00, 16},
+                                          {0xB600, 16}, {0xBE00, 16}, {0xF800, 24}, {0xF400, 8}};
+    for (const auto &b : kBlocks)
+        for (uint32_t r = b[0]; r < b[0] + b[1]; r += 8) {
+            uint32_t v[8];
+            for (unsigned i = 0; i < 8; ++i) v[i] = gpuRead(r + i);
+            IOLog("gpu regs %s %04x: %08x %08x %08x %08x %08x %08x %08x %08x\n", when, r, v[0], v[1], v[2], v[3], v[4], v[5], v[6],
+                  v[7]);
+        }
 }
 
 // SQE, hw_init, ring 0, CP_ME_INIT, then a CP_MEM_WRITE into the scratch page that the CPU reads back.
@@ -1141,6 +1165,8 @@ void hangRows(unsigned t) {
             changed();
         }
         ucheRow();
+        static bool oobDumped;
+        if (!oobDumped && (gIrqSeen & (1u << 24))) {oobDumped = true; regDump("oob");}   // RBBM_INT_0 UCHE_OOB_ACCESS
         IOSleep(2000);
     }
 }
@@ -1175,6 +1201,7 @@ void gpuThread(void *, wait_result_t) {
     if (gMode >= 8 && gColdOk) gxOn();
     const bool cp = gMode >= 9 && native_gpu_gx.gx_on && gpuContext() && cpStart();
     const bool irq = gMode >= 10 && cp && leaveSecure() && gpuInterrupt();
+    if (irq) regDump("init");
     if (gMode >= 11 && irq && publish()) {
         if (selfTest() && gMode >= 12) metal();
         native_gpu_step = 99;
