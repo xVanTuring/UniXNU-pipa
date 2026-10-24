@@ -334,6 +334,7 @@ extern volatile int native_legacy_unit_scale_status __attribute__((weak_import))
 extern volatile u32 native_legacy_unit_scale_calls __attribute__((weak_import));
 extern volatile u32 native_legacy_chosen_scale __attribute__((weak_import));
 extern volatile u32 native_legacy_chosen_rotation __attribute__((weak_import));
+extern unsigned native_legacy_swap_pacing(char *out, unsigned cap) __attribute__((weak_import));
 // The cores (drivers/ArmCpu): each logical core's start step (7 = running), the cores running, IPIs sent and taken, and the
 // SPI block standing in for SGIs.
 extern volatile u32 armcpu_smp_step[8] __attribute__((weak_import));
@@ -576,6 +577,8 @@ static void display_status(void) {
            &native_legacy_unit_scale_calls ? native_legacy_unit_scale_calls : 0, &native_legacy_chosen_scale ? native_legacy_chosen_scale : 0,
            &native_legacy_chosen_rotation ? native_legacy_chosen_rotation : 0);
   line("display: ", text);
+  // The frame rate while the UI moves (LegacyDisplayProbe.cpp): swaps less than 200 ms apart, their gaps, submit-to-retire.
+  if (&native_legacy_swap_pacing && native_legacy_swap_pacing(text, sizeof text)) line("display: ", text);
   for (unsigned i = 0; i < 8; ++i) {
     if (!boot_progress_ext[i][0]) continue;
     char ext[sizeof boot_progress_ext[i] + 1];

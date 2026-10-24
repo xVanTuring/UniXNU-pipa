@@ -189,18 +189,43 @@ void native_legacy_frame_colors_observed(const uint32_t *colors,const uint64_t *
 // and retired. Times are microseconds since boot; the last 64 are kept.
 struct SwapEvent {uint64_t submitted,offered,done;uint32_t number;};
 static SwapEvent swapEvents[64];static uint32_t swapEventCount;
+// Frame pacing over the whole run: the gap between consecutive accepted swaps when under 200 ms (the UI moving; a longer gap is the
+// UI at rest), counted, summed and sorted into gaps of up to 17, 34, 50, 67, 100 and 200 ms (about 1, 2, 3, 4, 6 and 12 refreshes at
+// 60 Hz), and each swap's submit-to-retire time. The averages over a whole round mix motion with rest; these do not.
+static uint64_t pacingLast,pacingFrames,pacingUs,pacingGaps[6],retireCount,retireUs,retireMax;
 extern "C" void native_legacy_swap_stage(unsigned stage) {
     const uint64_t now=probeNowUs();
     uint32_t total=swapEventCount;
     if(stage==0) {
+        if(pacingLast && now-pacingLast<200000) {
+            const uint64_t gap=now-pacingLast;
+            pacingFrames++;pacingUs+=gap;
+            pacingGaps[gap<=17000?0:gap<=34000?1:gap<=50000?2:gap<=67000?3:gap<=100000?4:5]++;
+        }
+        pacingLast=now;
         SwapEvent &e=swapEvents[total%64];e={now,0,0,total+1};swapEventCount=total+1;return;
     }
     uint32_t first=total>64?total-64:0;
     for(uint32_t i=first;i<total;++i) {
         SwapEvent &e=swapEvents[i%64];
         if(stage==1 && !e.offered && !e.done){e.offered=now;return;}
-        if(stage==2 && !e.done){e.done=now;if(!e.offered)e.offered=now;return;}
+        if(stage==2 && !e.done) {
+            e.done=now;if(!e.offered)e.offered=now;
+            const uint64_t life=now-e.submitted;
+            retireCount++;retireUs+=life;if(life>retireMax)retireMax=life;
+            return;
+        }
     }
+}
+extern "C" unsigned native_legacy_swap_pacing(char *out,unsigned cap) {
+    const uint64_t frames=pacingFrames,us=pacingUs,retired=retireCount;
+    if(!frames)return 0;
+    const uint64_t tenths=us?frames*10000000/us:0;
+    return snprintf(out,cap,"pacing moving %llu frames in %llu ms = %llu.%llu/s, gaps <=17 %llu <=34 %llu <=50 %llu <=67 %llu <=100 %llu <=200 %llu"
+        " | submit-to-retire mean %llu ms max %llu ms",(unsigned long long)frames,(unsigned long long)(us/1000),(unsigned long long)(tenths/10),
+        (unsigned long long)(tenths%10),(unsigned long long)pacingGaps[0],(unsigned long long)pacingGaps[1],(unsigned long long)pacingGaps[2],
+        (unsigned long long)pacingGaps[3],(unsigned long long)pacingGaps[4],(unsigned long long)pacingGaps[5],
+        (unsigned long long)(retired?retireUs/retired/1000:0),(unsigned long long)(retireMax/1000));
 }
 extern "C" unsigned native_legacy_swap_timeline(char *out,unsigned cap) {
     unsigned at=0;out[0]=0;
