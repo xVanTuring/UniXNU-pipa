@@ -286,6 +286,10 @@ touch_includes=['-I',str(ROOT/'kits/pipa'),'-I',str(ROOT/'drivers/NativeGeniSpi'
 probe_source=ROOT/'kits/pipa/TouchProbe.cpp';probe_obj=touch_dir/'TouchProbe.o'
 run([str(probe_source) if str(arg)==str(source) else str(probe_obj) if str(arg)==str(OUT/'LegacyDisplayProbe.o') else arg for arg in cmd]+touch_includes,
     cwd=r['directory'])
+# The GPU power and clock bring-up (GpuProbe.cpp, pipa-gpu=<mode>) the same way.
+gpu_source=ROOT/'kits/pipa/GpuProbe.cpp';gpu_obj=touch_dir/'GpuProbe.o'
+run([str(gpu_source) if str(arg)==str(source) else str(gpu_obj) if str(arg)==str(OUT/'LegacyDisplayProbe.o') else arg for arg in cmd]+touch_includes,
+    cwd=r['directory'])
 firmware=Path(os.environ.get('PIPA_TOUCH_FIRMWARE') or ROOT/'.cache/firmware/touch/novatek_nt36532_m82_fw_tm.bin')
 require(firmware.is_file(),f'Missing the touch firmware {firmware} (from the stock kernel\'s built-in firmware table)')
 blob=firmware.read_bytes()
@@ -307,7 +311,7 @@ def c_compile(c_source,c_obj):
         elif not value.startswith('-W'):out.append(value)
         j+=1
     run(out+['-Wall','-Wextra','-Werror']+touch_includes,cwd=c_record['directory'])
-touch_objs=[probe_obj]
+touch_objs=[probe_obj,gpu_obj]
 # Buttons.c (pipa-buttons=1, the power and volume keys over SPMI for the HID input) goes the same way.
 for c_source in (ROOT/'drivers/NativeGeniSpi/GeniSpi.c',ROOT/'drivers/NativeNovatekTouch/NvtProtocol.c',firmware_c,ROOT/'kits/pipa/Buttons.c'):
     c_obj=touch_dir/(c_source.stem+'.o');c_compile(c_source,c_obj);touch_objs.append(c_obj)
@@ -336,7 +340,8 @@ sources=[ROOT/'drivers/NativeMobileDisplay/NativeLegacyDisplay.cpp',ROOT/'driver
          ROOT/'drivers/NativeHidInput/NativeHidInput.cpp',ROOT/'scripts/build-native-hid-input.py',probe_source,
          ROOT/'kits/pipa/TouchBoard.h',ROOT/'kits/pipa/SmmuBypass.h',ROOT/'drivers/NativeGeniSpi/GeniSpi.c',
          ROOT/'drivers/NativeGeniSpi/GeniSpi.h',ROOT/'drivers/NativeNovatekTouch/NvtProtocol.c',
-         ROOT/'drivers/NativeNovatekTouch/NvtProtocol.h',firmware,ROOT/'kits/pipa/Buttons.c',ROOT/'kits/pipa/ButtonsCore.h']
+         ROOT/'drivers/NativeNovatekTouch/NvtProtocol.h',firmware,ROOT/'kits/pipa/Buttons.c',ROOT/'kits/pipa/ButtonsCore.h',
+         gpu_source,ROOT/'kits/pipa/GpuPowerBoard.h']
 print(run(['python3',ROOT/'scripts/build-arm-driver.py','NativeGOPPresenter'],text=True),end='')
 gop=ROOT/'build/native-gop-presenter';gop_late=gop/'NativeGOPPresenter.late.o'
 run([llvm/'llvm-objcopy','--remove-section=__DATA,__mod_init_func','--globalize-symbol=__GLOBAL__sub_I_NativeGOPPresenter.cpp',

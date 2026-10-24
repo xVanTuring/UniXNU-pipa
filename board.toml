@@ -234,6 +234,9 @@ kernel_args = [
   # The power and volume keys (package/Buttons.c): the PM8150 PON's and GPIO6's status over SPMI every 10 ms, read only, to the HID
   # input's report 2 (power, volume up, volume down). Each change is logged.
   "pipa-buttons=1",
+  # The Adreno 650's power and clocks up to a GMU that can be started (package/GpuProbe.cpp): CX power, the GPU SMMU's clocks,
+  # the command DB and the GMU clocks at 200 MHz; the GMU stays in reset. All steps passed on 2026-10-24 (two rounds).
+  "pipa-gpu=6",
 ]
 
 [payload.adt]

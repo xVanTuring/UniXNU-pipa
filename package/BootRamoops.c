@@ -403,6 +403,24 @@ static void buttons_status(void) {
   logged = changes;
   touch_row("buttons: ", native_buttons_row, sizeof native_buttons_row);
 }
+// The GPU bring-up (GpuProbe.cpp, pipa-gpu=<mode>): its rows whenever they change, and its step every 10 s while it runs (a hang
+// in a register read leaves the step it was at).
+extern char native_gpu_rows[13][120] __attribute__((weak_import));
+extern volatile unsigned native_gpu_changes __attribute__((weak_import));
+extern volatile unsigned native_gpu_step __attribute__((weak_import));
+static void gpu_status(int periodic) {
+  static unsigned logged;
+  if (!&native_gpu_rows || !&native_gpu_changes || !&native_gpu_step || !native_gpu_step) return;
+  if (periodic && native_gpu_step != 99) {
+    char text[32];
+    snprintf(text, sizeof text, "step %u", native_gpu_step);
+    line("gpu: ", text);
+  }
+  unsigned changes = native_gpu_changes;
+  if (changes == logged) return;
+  logged = changes;
+  for (unsigned i = 0; i < 13; ++i) touch_row("gpu: ", native_gpu_rows[i], sizeof native_gpu_rows[i]);
+}
 
 // The lines sheng's progress page shows for other components (KeyStoreProbe.cpp writes line 0); logged with the display line.
 char boot_progress_ext[8][48];
@@ -450,6 +468,7 @@ static void writer(void *argument, int result) {
     if (pass % 100 == 0) {display_status(); cpu_status(); touch_status();}
     if (pass % 5 == 0) touch_strokes();
     buttons_status();
+    gpu_status(pass % 100 == 0);
     if (restart_after && ticks() - start >= limit) {
       char text[64];
       snprintf(text, sizeof text, "%u s after the zone was mapped (pipa-restart-after)", restart_after);
