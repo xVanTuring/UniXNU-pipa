@@ -272,7 +272,9 @@ chip_id = "207"
 owned_memory_size = "0x170000000"
 root_match_volume_uuid = "04769D26-2CA0-4825-B443-E2E5F88300F2"   # the OS volume of the same IPSW
 # All eight cores, boot CPU first: 0..0x300 Kryo 585 Silver (Cortex-A55), 0x400..0x600 Gold and 0x700 Gold Prime (Cortex-A77),
-# one scheduler cluster (no cluster-type, as on sheng). "0" keeps the boot CPU only (pipa's first boots, 2026-10-23).
+# as two scheduler clusters, E (the A55s) and P (the A77s), under the Edge scheduler (make-pipa-adt.py cluster-type,
+# package/xnu-patches/native-smp-type-clusters.patch and ArmCpu's registration by type, all UniXNU-tb128fu's): on one cluster
+# UniXNU-tb128fu's render server committed 72 % of its frames from a little core. "0" keeps the boot CPU only (2026-10-23).
 cpu_regs = "0,0x100,0x200,0x300,0x400,0x500,0x600,0x700"
 packed_data_ramdisk = true
 ipad_identity = true
