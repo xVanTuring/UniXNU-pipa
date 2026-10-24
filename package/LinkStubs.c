@@ -9,11 +9,26 @@ __attribute__((weak)) void native_legacy_display_probe(void)
 {
 }
 
-// NativeHidInput registers its button callback with a board button driver (power, volume up/down); this board has none yet
-// (as UniXNU-tb128fu's BootProgressStubs.c). The kernel is linked statically, where an undefined weak reference does not link.
+// NativeHidInput registers its button callback with a board button driver (power, volume up/down). Weak: Buttons.c (in the
+// display archive) defines the real one. The kernel is linked statically, where an undefined weak reference does not link.
 void native_buttons_set_sink(void (*sink)(void *, unsigned), void *context);
 __attribute__((weak)) void native_buttons_set_sink(void (*sink)(void *, unsigned), void *context)
 {
   (void)sink;
   (void)context;
+}
+
+// NativeAdrenoPublish.cpp (CONFIG_XNU_NATIVE_ADRENO) hands the Metal plugin's exported pipeline caches to the board log, which
+// UniXNU-tb128fu's BootLog.c writes into NativeUfs's export region. pipa has no UFS write path yet: -4 is BootLog.c's answer
+// when there is no export region.
+typedef unsigned int u32;
+int boot_log_export_put(u32 generation, u32 total, u32 offset, const void *data, u32 size);
+__attribute__((weak)) int boot_log_export_put(u32 generation, u32 total, u32 offset, const void *data, u32 size)
+{
+  (void)generation;
+  (void)total;
+  (void)offset;
+  (void)data;
+  (void)size;
+  return -4;
 }

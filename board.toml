@@ -59,6 +59,8 @@ archives = [
   # The 395-byte owner root anchor and the XNU crypto adapter, the same pinned key as UniXNU-tb128fu; the signed envelopes are
   # in userdata (UniXNU-tb128fu's userdata-root image).
   "build-verified-root-key.py --pin 70a5ea346d2d779a7ef43eb4ed8b17f54488e160d8c2a6d6420969664e3ae798",
+  # NativeAdreno for the Adreno 650 with the GMU's SMMU context, the HFI kit and the A650 cold start (CONFIG_XNU_NATIVE_ADRENO).
+  "build-native-adreno-a650.py",
   # The display, key store stand-in and HID input (CONFIG_XNU_NATIVE_LEGACY_DISPLAY); it reads the previous kernel step's
   # kernel.macho and UniXNU-qemu's display reference (see its header).
   "build-native-legacy-display.py",
@@ -234,9 +236,10 @@ kernel_args = [
   # The power and volume keys (package/Buttons.c): the PM8150 PON's and GPIO6's status over SPMI every 10 ms, read only, to the HID
   # input's report 2 (power, volume up, volume down). Each change is logged.
   "pipa-buttons=1",
-  # The Adreno 650's power and clocks up to a GMU that can be started (package/GpuProbe.cpp): CX power, the GPU SMMU's clocks,
-  # the command DB and the GMU clocks at 200 MHz; the GMU stays in reset. All steps passed on 2026-10-24 (two rounds).
-  "pipa-gpu=6",
+  # The Adreno 650 up to a running GMU (package/GpuProbe.cpp): CX power, the GPU SMMU's clocks, the command DB, the GMU clocks
+  # at 200 MHz, the GMU's SMMU context and the GMU cold start with its HFI startup messages; GX stays off. All passed on
+  # 2026-10-24 (mode 6 in two rounds, mode 7 in one).
+  "pipa-gpu=7",
 ]
 
 [payload.adt]

@@ -14,3 +14,11 @@
 	path = drivers/NativeNovatekTouch
 	url = https://github.com/xVanTuring/NativeNovatekTouch.git
 	branch = pipa
+[submodule "drivers/NativeAdreno"]
+	path = drivers/NativeAdreno
+	url = https://github.com/xVanTuring/NativeAdreno.git
+	branch = pipa
+[submodule "kits/ArmSmmu4K"]
+	path = kits/ArmSmmu4K
+	url = https://github.com/xVanTuring/ArmSmmu4K.git
+	branch = pipa

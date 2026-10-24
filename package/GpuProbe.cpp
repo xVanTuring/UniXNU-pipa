@@ -10,24 +10,33 @@
 //      GMU's votes are built from, and the GMU and RSCC state words if the GMU clocks already run; nothing more is written
 //   6  as 5, with the GMU clocks brought up first (GPLL0 GPU votes, gpu_cc_gmu_clk_src at 200 MHz, the five GMU branches); the GMU
 //      itself stays in reset, no GMU, RSCC or GPU register is written
-// Mode 4 is kept for the GMU's SMMU context and 7 on for the GMU cold start (next steps, not written yet). The rows below go to
-// the kernel log whenever they change (BootRamoops.c). The sequence starts 5 s after the late probe, so the display and the log
-// thread already run if a read hangs the bus. Nothing here has run on the tablet yet.
+//   7  as 6, then, only if the clocks came up, the SMMU had no stream mapped, the command DB gave its resources and the GMU sits in
+//      reset: the GMU's own SMMU context through NativeAdreno (bank 1, ASID 1; the GMU kernel stream 5 under its DT mask 0x400 as
+//      two exact routes, 5 on SMR 2 and 0x405 on SMR 3), a write-combined CPU view of its five regions, and the A650 cold start
+//      (package/A650Gmu.c) with the embedded a650_gmu.bin and the HFI tables built from the command DB. GX stays off.
+// The rows below go to the kernel log whenever they change (BootRamoops.c). The sequence starts 5 s after the late probe, so the
+// display and the log thread already run if a read hangs the bus. Modes 1-6 ran on the tablet on 2026-10-24; mode 7 has not.
 #include <IOKit/IOService.h>
 #include <IOKit/IOLib.h>
 #include <IOKit/IOMemoryDescriptor.h>
 #include <libkern/c++/OSSharedPtr.h>
 #include <kern/thread.h>
+#include <kern/clock.h>
 #include <pexpert/pexpert.h>
 #include <string.h>
 extern "C" {
 #include "GpuPowerBoard.h"
+#include "A650Gmu.h"
+extern const uint8_t native_gpu_gmu_firmware[] __attribute__((weak_import));
+extern const uint32_t native_gpu_gmu_firmware_size __attribute__((weak_import));
 }
+#include "NativeAdrenoGmuContext.h"
 
 // Rows (at most 119 characters each, as the log copies them): 0 summary, 1 GCC, 2 GPUCC, 3 SMMU, 4-5 GMU clocks, 6-7 GMU state,
-// 8 command DB ARC entries, 9 its BCM entries, 10-12 the gfx, mx and cx level lists.
+// 8 command DB ARC entries, 9 its BCM entries, 10-12 the gfx, mx and cx level lists, 13 the GMU's SMMU context, 14 the cold
+// start's load, 15 its HFI messages, 16 the GMU state after it.
 enum {kRowSummary, kRowGcc, kRowGpucc, kRowSmmu, kRowClk, kRowClk2, kRowGmu, kRowGmu2, kRowDbArc, kRowDbBcm, kRowLevels,
-      kRows = kRowLevels + 3};
+      kRowContext = kRowLevels + 3, kRowLoad, kRowHfi, kRowAfter, kRows};
 extern "C" {
 char native_gpu_rows[kRows][120];
 volatile uint32_t native_gpu_changes;
@@ -92,8 +101,11 @@ void rowsBasic(const gpb_result &r) {
     changed();
 }
 
-// The command DB, copied with aligned 32-bit reads (it is mapped as device memory).
+// The command DB, copied with aligned 32-bit reads (it is mapped as device memory), and the lookups mode 7 builds from:
+// gfx.lvl, mx.lvl, cx.lvl, gmxc.lvl, SH0, MC0, ACV, CN0.
 alignas(8) uint8_t gCmdDb[GPB_CMD_DB_BYTES];
+gpb_cmd_db_entry gDbFound[8];
+int gDbRc[8] = {-1, -1, -1, -1, -1, -1, -1, -1};
 void commandDb() {
     native_gpu_step = 50;
     IODeviceMemory *memory = IODeviceMemory::withRange(GPB_CMD_DB_BASE, GPB_CMD_DB_BYTES);
@@ -109,8 +121,8 @@ void commandDb() {
         memcpy(gCmdDb + 4 * i, &v, 4);
     }
     static const char *const names[8] = {"gfx.lvl", "mx.lvl", "cx.lvl", "gmxc.lvl", "SH0", "MC0", "ACV", "CN0"};
-    gpb_cmd_db_entry found[8] = {};
-    int rc[8];
+    gpb_cmd_db_entry *found = gDbFound;
+    int *rc = gDbRc;
     for (unsigned i = 0; i < 8; ++i) rc[i] = gpb_cmd_db_find(gCmdDb, sizeof gCmdDb, names[i], &found[i]);
     // Row 8: version, magic and the ARC entries; row 9: the BCM entries. Each as name:address/aux bytes, or name:status.
     for (unsigned half = 0; half < 2; ++half) {
@@ -149,6 +161,124 @@ void gmuState(const gpb_io &io, gpb_result &r, uint32_t cx_gmu, uint32_t ahb) {
     changed();
 }
 
+// Mode 7. The GMU's SMMU context: the whole adreno SMMU window (DTS kgsl-smmu@3da0000 size 0x10000), bank 1 / ASID 1 (Linux
+// gives bank 0 to the GPU), the GMU kernel stream 5 and, for its mask 0x400, 0x405 on the next SMR.
+constexpr uint64_t kSmmuWindow = 0x10000, kPdcPhys = 0x0b290000, kPdcBytes = 0x10000;
+constexpr unsigned kGmuBank = 1, kGmuAsid = 1, kGmuSlots[2] = {2, 3}, kGmuSids[2] = {5, 0x405};
+OSSharedPtr<IOMemoryMap> gSmmuMap, gPdcMap, gPayloadMaps[5];
+A650GmuDevice gDevice;
+A650GmuConfig gConfig;
+AdrenoHfiStartupConfig gStartup;
+A650GmuStartupResult gCold;
+extern "C" {
+NativeAdrenoGmuContextReport native_gpu_gmu_context;
+}
+void contextProgress(uint32_t step) {native_gpu_step = 80 + step;}
+volatile uint8_t *gWin[A650GmuWindows];
+int gmuRead(void *, unsigned w, size_t at, uint32_t *out) {
+    if (w >= A650GmuWindows || !gWin[w] || (at & 3) || at + 4 > gDevice.io.bytes[w]) return 1;
+    *out = *reinterpret_cast<volatile uint32_t *>(gWin[w] + at);
+    return 0;
+}
+int gmuWrite(void *, unsigned w, size_t at, uint32_t value) {
+    if (w >= A650GmuWindows || !gWin[w] || (at & 3) || at + 4 > gDevice.io.bytes[w]) return 1;
+    *reinterpret_cast<volatile uint32_t *>(gWin[w] + at) = value;
+    return 0;
+}
+int gmuBarrier(void *) {__asm__ volatile("dsb sy" ::: "memory"); return 0;}
+int gmuNow(void *, uint64_t *us) {
+    uint64_t ns = 0;
+    absolutetime_to_nanoseconds(mach_absolute_time(), &ns);
+    *us = ns / 1000;
+    return 0;
+}
+int gmuWait(void *, unsigned us) {IODelay(us); return 0;}
+void gmuColdStart(const gpb_result &r, const gpb_gmu_clock_on &o) {
+    char *ctx = native_gpu_rows[kRowContext], *load = native_gpu_rows[kRowLoad];
+    const size_t cap = sizeof native_gpu_rows[0];
+    native_gpu_step = 79;
+    if (!&native_gpu_gmu_firmware || !&native_gpu_gmu_firmware_size || !native_gpu_gmu_firmware_size) {
+        snprintf(ctx, cap, "GMUCTX no firmware linked"); changed(); return;
+    }
+    if (o.step != 5 || o.failed || r.smmu != GPB_DONE || r.smr_valid || gDbRc[0] || gDbRc[1] || gDbRc[2] || gDbRc[4] || gDbRc[5] ||
+        gDbRc[6] || gDbRc[7] || native_gpu_gmu_state.sysreset != 1) {
+        snprintf(ctx, cap, "GMUCTX skipped: clocks %u/%d smmu %s smr %u cmddb %d%d%d%d%d%d%d gmu reset %08x", o.step, o.failed,
+                 gpb_state_text(r.smmu), r.smr_valid, gDbRc[0], gDbRc[1], gDbRc[2], gDbRc[4], gDbRc[5], gDbRc[6], gDbRc[7],
+                 native_gpu_gmu_state.sysreset);
+        changed();
+        return;
+    }
+    IODeviceMemory *memory = IODeviceMemory::withRange(GPB_SMMU_BASE, kSmmuWindow);
+    if (memory) {
+        gSmmuMap = OSSharedPtr<IOMemoryMap>(memory->map(kIOMapAnywhere | kIOMapInhibitCache), OSNoRetain);
+        memory->release();
+    }
+    if (!gSmmuMap) {snprintf(ctx, cap, "GMUCTX nomap"); changed(); return;}
+    NativeAdrenoGmuContextReport &g = native_gpu_gmu_context;
+    const IOReturn status = NativeAdrenoGmuContextBringupRoutes(reinterpret_cast<volatile uint8_t *>(gSmmuMap->getVirtualAddress()),
+        kSmmuWindow, kGmuBank, kGmuAsid, kGmuSlots, kGmuSids, 2, contextProgress, &g);
+    snprintf(ctx, cap, "GMUCTX step %u status %x kit %u/%u routes %u id2 %x program %u/%u/%u ttbr0 %llx smr %08x s2cr %08x",
+             g.step, static_cast<unsigned>(status), g.program_status, g.route_status, g.routes_verified, g.id2, g.program_phase,
+             g.program_readback_valid, g.program_enabled, static_cast<unsigned long long>(g.ttbr0), g.smr, g.s2cr);
+    changed();
+    if (status) return;
+    // The five regions (icache, dummy, debug, log, hfi): the GMU maps them Normal non-cacheable, the CPU writes them combined.
+    NativeAdrenoGmuPayload payloads[5];
+    const IOReturn got = NativeAdrenoGmuContextPayloads(payloads);
+    if (got) {snprintf(load, cap, "LOAD payloads %x", static_cast<unsigned>(got)); changed(); return;}
+    A650GmuMemory views[5];
+    for (unsigned i = 0; i < 5; ++i) {
+        IODeviceMemory *m = IODeviceMemory::withRange(payloads[i].physical, payloads[i].bytes);
+        if (m) {
+            gPayloadMaps[i] = OSSharedPtr<IOMemoryMap>(m->map(kIOMapAnywhere | kIOMapWriteCombineCache), OSNoRetain);
+            m->release();
+        }
+        if (!gPayloadMaps[i]) {snprintf(load, cap, "LOAD nomap payload %u", i); changed(); return;}
+        views[i] = {reinterpret_cast<volatile uint32_t *>(gPayloadMaps[i]->getVirtualAddress()), size_t(payloads[i].bytes), payloads[i].iova};
+    }
+    IODeviceMemory *pdc = IODeviceMemory::withRange(kPdcPhys, kPdcBytes);
+    if (pdc) {
+        gPdcMap = OSSharedPtr<IOMemoryMap>(pdc->map(kIOMapAnywhere | kIOMapInhibitCache), OSNoRetain);
+        pdc->release();
+    }
+    if (!gPdcMap || !gVa[GPB_WIN_GMU] || !gVa[GPB_WIN_RSCC]) {snprintf(load, cap, "LOAD nomap window"); changed(); return;}
+    gWin[A650GmuCore] = reinterpret_cast<volatile uint8_t *>(gVa[GPB_WIN_GMU]);
+    gWin[A650GmuRscc] = reinterpret_cast<volatile uint8_t *>(gVa[GPB_WIN_RSCC]);
+    gWin[A650GmuPdc] = reinterpret_cast<volatile uint8_t *>(gPdcMap->getVirtualAddress());
+    gDevice = {};
+    gDevice.io = {nullptr, {A650_GMU_CORE_BYTES, A650_GMU_RSCC_BYTES, A650_GMU_PDC_BYTES}, gmuRead, gmuWrite, gmuBarrier};
+    gDevice.services = {nullptr, gmuNow, gmuWait};
+    gConfig = {A650_GMU_CHIP_ID, native_gpu_gmu_firmware, native_gpu_gmu_firmware_size, views[0], views[1], views[3], views[4], 100};
+    const AdrenoHfiStartupStatus built = A650GmuBuildStartup(gDbFound[0].aux, gDbFound[0].aux_bytes, gDbFound[1].aux,
+        gDbFound[1].aux_bytes, gDbFound[2].aux, gDbFound[2].aux_bytes, gDbFound[5].address, gDbFound[4].address,
+        gDbFound[6].address, gDbFound[7].address, &gStartup);
+    if (built) {snprintf(load, cap, "LOAD vote table %u", built); changed(); return;}
+    snprintf(load, cap, "LOAD running, gpu votes %08x..%08x gmu %08x", gStartup.gpu[1].vote, gStartup.gpu[7].vote, gStartup.gmu[1].vote);
+    changed();
+    native_gpu_step = 90;
+    const A650GmuStartupLimits limits = {1000, 100, 50000, 2000000};
+    const A650GmuStatus cold = A650GmuColdStart(&gDevice, &gConfig, &gStartup, &limits, &gCold);
+    native_gpu_step = cold ? 98 : 97;
+    const A650GmuResult &l = gCold.load;
+    snprintf(load, cap, "LOAD status %u phase %u blocks %u version %08x init %08x hfi %08x ready %u%u ao %08x cm3 %08x reset %u rsc %u",
+             cold, l.phase, l.blocks, l.firmware_version, l.firmware_init_result, l.hfi_status, l.firmware_ready_observed,
+             l.hfi_ready_observed, l.ao_fault_status, l.cm3_fault_status, l.reset_verified, l.rsc_stop_status);
+    const AdrenoHfiStartupResult &p = gCold.protocol;
+    const AdrenoHfi &q = gDevice.hfi;
+    snprintf(native_gpu_rows[kRowHfi], cap, "HFI status %u stage %u acked %x error %x transport %u sent %u %llu ms skipped %u/%x/%x health %u",
+             gCold.protocol_status, p.stage, p.acknowledged_stages, p.firmware_error, p.transport_status, p.published_commands,
+             static_cast<unsigned long long>(p.elapsed_us / 1000), q.skipped, q.skipped_header, q.skipped_ret, gCold.health_status);
+    uint32_t after[5] = {};
+    gmuRead(nullptr, A650GmuCore, 0x5000 * 4, &after[0]);   // CM3_SYSRESET
+    gmuRead(nullptr, A650GmuCore, 0x501c * 4, &after[1]);   // CM3_FW_INIT_RESULT
+    gmuRead(nullptr, A650GmuCore, 0x5180 * 4, &after[2]);   // HFI_CTRL_STATUS
+    gmuRead(nullptr, A650GmuCore, 0x50d0 * 4, &after[3]);   // SPTPRAC_PWR_CLK_STATUS (GX)
+    gmuRead(nullptr, A650GmuCore, 0x9305 * 4, &after[4]);   // AO_HOST_INTERRUPT_STATUS
+    snprintf(native_gpu_rows[kRowAfter], cap, "AFTER sysreset %08x init %08x hfi %08x gx %08x ao %08x", after[0], after[1], after[2],
+             after[3], after[4]);
+    changed();
+}
+
 void gpuThread(void *, wait_result_t) {
     IOSleep(5000);
     native_gpu_step = 1;
@@ -175,6 +305,7 @@ void gpuThread(void *, wait_result_t) {
         cx_gmu = o.cx_gmu; ahb = o.ahb;
     }
     gmuState(io, r, cx_gmu, ahb);
+    if (gMode >= 7) gmuColdStart(r, native_gpu_clocks);
     native_gpu_step = 99;
 }
 }  // namespace
@@ -182,7 +313,7 @@ void gpuThread(void *, wait_result_t) {
 extern "C" void native_gpu_probe(void) {
     unsigned mode = 0;
     if (gMode || !PE_parse_boot_argn("pipa-gpu", &mode, sizeof mode) || !mode) return;
-    gMode = mode > 6 ? 6 : mode;
+    gMode = mode > 7 ? 7 : mode;
     thread_t thread = nullptr;
     if (kernel_thread_start(gpuThread, nullptr, &thread) == KERN_SUCCESS) thread_deallocate(thread);
 }

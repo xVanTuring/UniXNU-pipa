@@ -31,6 +31,8 @@ while [ $# -gt 0 ]; do
   esac
 done
 lines=${1:-20}
+# The kernel arguments are written into the payload when it is built: without a build they would be silently ignored.
+if [ $build = 0 ] && [ -n "$extra_args" ]; then echo "--arg needs a build (it goes into the payload); drop --no-build"; exit 1; fi
 image=$unixnu/out/pipa/boot/boot-kernel-round.img
 ipsw=$unixnu/out/ipsw/iPad_Pro_HFR_17.7.11_21H461_Restore.ipsw
 

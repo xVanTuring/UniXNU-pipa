@@ -58,4 +58,7 @@ CONFIG_XNU_NATIVE_MOBILE_DISPLAY=n
 # The display, key store stand-in and HID input (scripts/build-native-legacy-display.py, drivers/NativeMobileDisplay of the
 # pipa branch): IOMobileGraphicsFamily loaded from bsd_init, NativeLegacyDisplay on the firmware frame buffer.
 CONFIG_XNU_NATIVE_LEGACY_DISPLAY=y
+# NativeAdreno for the Adreno 650 (scripts/build-native-adreno-a650.py: the a6xx GPU half, the GMU's SMMU context, the HFI kit
+# and package/A650Gmu.c); no personality, the board's GPU probe (package/GpuProbe.cpp) drives it.
+CONFIG_XNU_NATIVE_ADRENO=y
 CONFIG_XNU_ARMVIRT_PLATFORM=n
