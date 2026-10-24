@@ -12,6 +12,9 @@
 # the previous build's headers). The build reads the local IPSW (UNIXNU_IPSW), never Apple's server; it shares the UniXNU checkout
 # with other boards: it waits while another unixnu runs, and puts out/state.json back. The payload carries UniXNU-tb128fu's 8 GiB
 # Data seed with Setup marked done and the original static + System trust caches (UniXNU's build/, see UniXNU-tb128fu's README).
+# With a GPU user-space directory (PIPA_GPU_USERSPACE, default UniXNU-tb128fu's build of the same NativeMetal plugin, Turnip and
+# adrenoprobed: none of them is bound to a GPU model) the payload carries its GPU addon and its trust bundle (the owner module of
+# the plugin, then the same two original modules) instead.
 set -u
 here=$(cd "$(dirname "$0")/.." && pwd)
 unixnu=$(cd "$here/../UniXNU" && pwd)
@@ -35,6 +38,15 @@ lines=${1:-20}
 if [ $build = 0 ] && [ -n "$extra_args" ]; then echo "--arg needs a build (it goes into the payload); drop --no-build"; exit 1; fi
 image=$unixnu/out/pipa/boot/boot-kernel-round.img
 ipsw=$unixnu/out/ipsw/iPad_Pro_HFR_17.7.11_21H461_Restore.ipsw
+gpu=${PIPA_GPU_USERSPACE-$unixnu/out/tb128fu/tree/build/adreno-metal-plugin}
+trust="--trust-cache build/original-static-system-trust/original-static-system.bundle"
+gpu_addon=""
+if [ -n "$gpu" ]; then
+  [ -f "$gpu/gpu-addon-clients.bin" ] && [ -f "$gpu/owner-trust.bundle" ] || { echo "no GPU addon and trust bundle in $gpu"; exit 1; }
+  # make-owner-trust-bundle.py checked the original modules in it byte for byte; the payload takes it in place of --trust-cache.
+  trust="--owner-trust-cache $gpu/owner-trust.bundle"
+  gpu_addon="--gpu-addon $gpu/gpu-addon-clients.bin"
+fi
 
 if [ $build = 1 ]; then
   [ -f "$ipsw" ] || { echo "the local IPSW $ipsw is missing"; exit 1; }
@@ -49,9 +61,8 @@ if [ $build = 1 ]; then
     ./unixnu defconfig pipa_defconfig -D "$here" > "$log" 2>&1 &&
       ./unixnu build kernel -D "$here" >> "$log" 2>&1 &&
       { [ $twice = 0 ] || ./unixnu build kernel -D "$here" >> "$log" 2>&1; } &&
-      ./unixnu build payload -D "$here" --unique-chip-id "$(cat "$here/.cache/platform-seed")" $extra_args \
-        --data-ramdisk build/owner-data-fixture/owner-data-8g.dbr --skip-setup \
-        --trust-cache build/original-static-system-trust/original-static-system.bundle >> "$log" 2>&1 &&
+      ./unixnu build payload -D "$here" --unique-chip-id "$(cat "$here/.cache/platform-seed")" $extra_args $gpu_addon \
+        --data-ramdisk build/owner-data-fixture/owner-data-8g.dbr --skip-setup $trust >> "$log" 2>&1 &&
       ./unixnu bootimg -D "$here" --dtb "$uefi/Resources/DTBs/pipa.dtb" -o "$image" >> "$log" 2>&1
   )
   rc=$?

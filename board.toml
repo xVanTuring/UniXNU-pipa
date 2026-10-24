@@ -61,6 +61,8 @@ archives = [
   "build-verified-root-key.py --pin 70a5ea346d2d779a7ef43eb4ed8b17f54488e160d8c2a6d6420969664e3ae798",
   # NativeAdreno for the Adreno 650 with the GMU's SMMU context, the HFI kit and the A650 cold start (CONFIG_XNU_NATIVE_ADRENO).
   "build-native-adreno-a650.py",
+  # The staged accelerator class added to the same archive (GpuProbe.cpp mode 12), as on UniXNU-tb128fu.
+  "build-native-adreno-accelerator.py",
   # The display, key store stand-in and HID input (CONFIG_XNU_NATIVE_LEGACY_DISPLAY); it reads the previous kernel step's
   # kernel.macho and UniXNU-qemu's display reference (see its header).
   "build-native-legacy-display.py",
@@ -160,7 +162,8 @@ dram_size = "0x980000000"
 skip_setup_tool = "scripts/seed-data-skip-setup.py"
 # No input device yet: without these SpringBoard preferences iPadOS turns the display off about 30 s after it starts and
 # puts the system to sleep, which ArmCpu does not support (UniXNU-tb128fu, UniXNU-qemu).
-skip_setup_args = ["--no-auto-dim"]
+# --plain-framebuffer: the render server's 8-bit, uncompressed framebuffer for the Metal plugin of the GPU addon.
+skip_setup_args = ["--no-auto-dim", "--plain-framebuffer"]
 panic_screen = true                  # patch panic() screen output into the payload copy of the kernel
 # The original static/System trust caches of the same IPSW, as accepted by UniXNU-sheng.
 trust_cache_sha256 = [
@@ -239,8 +242,19 @@ kernel_args = [
   # The Adreno 650 up to a non-secure GPU with its interrupt (package/GpuProbe.cpp): CX power, the GPU SMMU's clocks, the command
   # DB, the GMU clocks at 200 MHz, the GMU's SMMU context, the GMU cold start with its HFI startup messages, the GX vote (305 MHz)
   # and GPU_SET, the GPU's SMMU context, the A650 hw_init, the SQE, ring 0, CP_ME_INIT, a CP_MEM_WRITE read back, the zap shader
-  # through PAS 13 with CP_SET_SECURE_MODE(0), and the GPU interrupt (SPI 300). All passed on 2026-10-24.
-  "pipa-gpu=10",
+  # through PAS 13 with CP_SET_SECURE_MODE(0), and the GPU interrupt (SPI 300): all passed on 2026-10-24. Then the device for
+  # user clients with two kernel rounds of the user-client path (mode 11), and the staged accelerator for Metal (mode 12).
+  "pipa-gpu=12",
+  # Turnip's options (GpuProbe.cpp metal()). In GMEM passes the first Metal frames hung (2026-10-24, the GMEM window at 0 and at
+  # 16 MiB alike): CP_DRAW_INDX_OFFSET never finished, RBBM_HANG_DETECT after UCHE_OOB_ACCESS, no SMMU fault. In system memory
+  # every submission completed.
+  "pipa-turnip-debug=sysmem,nocb",
+  # The GPU addon of the payload (the Metal plugin, Turnip, adrenoprobed; scripts/kernel-round.sh passes it) written into the Data
+  # volume and mounted before launchd starts; the name is UniXNU-sheng's.
+  "sheng-gpu-addon=1",
+  # The GPU hand-off: the Metal plugin copies each finished frame into the firmware frame buffer with the GPU. A refused offer or a
+  # failed copy falls back to the CPU copy (drivers/NativeMobileDisplay NativeLegacyDisplay.cpp).
+  "sheng-fb-gpu=1",
 ]
 
 [payload.adt]

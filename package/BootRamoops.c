@@ -69,6 +69,8 @@ extern int kernel_thread_start(void (*continuation)(void *, int), void *paramete
 extern void thread_deallocate(void *thread);
 extern void IOSleep(unsigned milliseconds);
 extern int snprintf(char *, unsigned long, const char *, ...);
+extern int strncmp(const char *, const char *, unsigned long);
+extern unsigned long strlcpy(char *, const char *, unsigned long);
 struct msgbuf {int msg_magic, msg_size, msg_bufx, msg_bufr; char *msg_bufc;};
 extern struct msgbuf *msgbufp;
 
@@ -403,9 +405,10 @@ static void buttons_status(void) {
   logged = changes;
   touch_row("buttons: ", native_buttons_row, sizeof native_buttons_row);
 }
-// The GPU bring-up (GpuProbe.cpp, pipa-gpu=<mode>): its rows whenever they change, and its step every 10 s while it runs (a hang
-// in a register read leaves the step it was at).
-extern char native_gpu_rows[23][120] __attribute__((weak_import));
+// The GPU bring-up (GpuProbe.cpp, pipa-gpu=<mode>): each row whose text changed, and its step every 10 s while it runs (a hang
+// in a register read leaves the step it was at). Once the device is published its live row changes every few seconds; only that
+// row is written then.
+extern char native_gpu_rows[28][120] __attribute__((weak_import));
 extern volatile unsigned native_gpu_changes __attribute__((weak_import));
 extern volatile unsigned native_gpu_step __attribute__((weak_import));
 static void gpu_status(int periodic) {
@@ -419,7 +422,98 @@ static void gpu_status(int periodic) {
   unsigned changes = native_gpu_changes;
   if (changes == logged) return;
   logged = changes;
-  for (unsigned i = 0; i < 23; ++i) touch_row("gpu: ", native_gpu_rows[i], sizeof native_gpu_rows[i]);
+  static char last[28][120];
+  for (unsigned i = 0; i < 28; ++i) {
+    if (!strncmp(last[i], native_gpu_rows[i], sizeof last[i])) continue;
+    strlcpy(last[i], native_gpu_rows[i], sizeof last[i]);
+    touch_row("gpu: ", last[i], sizeof last[i]);
+  }
+}
+
+// The Metal stack above the GPU, as UniXNU-tb128fu's BootLog.c reports it: the GPU addon written into Data and its overlay mounts,
+// the plugin's opens and progress markers with its two text lines, the GPU clients, the newest opens of the accelerator, the
+// scanout client's waits for a frame, the fence waits, and the display's GPU hand-off fallbacks. Each row is written when its text
+// changes (every 10 s and before a restart).
+struct native_adreno_client_record {char name[20]; u32 opens, refused, closes, slot, peak_mib, last_refusal;};
+extern struct native_adreno_client_record native_adreno_client_log[8] __attribute__((weak_import));
+struct native_adreno_metal_diag_view {
+  u32 opens, busy, bad, closes, reports, property_reads, foreign_opens, foreign_type, name_reads, calls, last_selector, last_status,
+      ext_entries, ext_selector, ext_status, ext_in, ext_out, tunnel_calls, probes, sel_bits[8], mb_maps, mb_calls, marks_total, marks[16],
+      chk_macf, chk_res, chk_type, type_pass_lo, type_pass_hi, attach_status, inflight, inflight_since_calls, forced_unmaps;
+  char opener[3][17], reader[3][17], name_reader[17], starter[3][17], report[64], report2[64];
+};
+extern struct native_adreno_metal_diag_view native_adreno_metal_diag __attribute__((weak_import));
+struct native_adreno_open_record {char name[20]; u32 type, macf, res, attach, foreign;};
+extern struct native_adreno_open_record native_adreno_open_log[8] __attribute__((weak_import));
+extern volatile u32 native_adreno_open_log_count __attribute__((weak_import));
+extern volatile int native_gpu_addon_files __attribute__((weak_import)), native_gpu_addon_written __attribute__((weak_import)),
+    native_gpu_addon_same __attribute__((weak_import)), native_gpu_addon_failed __attribute__((weak_import)),
+    native_gpu_addon_error __attribute__((weak_import));
+extern volatile int native_gpu_addon_stage __attribute__((weak_import)), native_gpu_addon_status __attribute__((weak_import)),
+    native_gpu_addon2_stage __attribute__((weak_import)), native_gpu_addon2_status __attribute__((weak_import)),
+    native_gpu_addon3_stage __attribute__((weak_import)), native_gpu_addon3_status __attribute__((weak_import));
+extern volatile u64 native_gop_wait_stats[7] __attribute__((weak_import));
+extern volatile u32 native_adreno_fence_wait[8] __attribute__((weak_import));
+extern volatile u32 native_legacy_gpu_fallbacks __attribute__((weak_import)), native_legacy_gpu_last_status __attribute__((weak_import));
+extern volatile u64 native_legacy_early_retires __attribute__((weak_import)), native_legacy_early_failures __attribute__((weak_import));
+static void stack_row(unsigned index, const char *text) {
+  static char last[8][300];
+  if (!strncmp(last[index], text, sizeof last[index])) return;
+  strlcpy(last[index], text, sizeof last[index]);
+  line("gpu stack: ", last[index]);
+}
+static void gpu_stack_status(void) {
+  char row[300];
+  if (&native_gpu_addon_files) {
+    snprintf(row, sizeof row, "addon files=%d written=%d same=%d failed=%d error=%d | mounts %d.%x %d.%x %d.%x",
+             native_gpu_addon_files, native_gpu_addon_written, native_gpu_addon_same, native_gpu_addon_failed, native_gpu_addon_error,
+             native_gpu_addon_stage, (unsigned)native_gpu_addon_status, native_gpu_addon2_stage, (unsigned)native_gpu_addon2_status,
+             native_gpu_addon3_stage, (unsigned)native_gpu_addon3_status);
+    stack_row(0, row);
+  }
+  if (&native_adreno_metal_diag) {
+    const struct native_adreno_metal_diag_view *d = &native_adreno_metal_diag;
+    const unsigned total = d->marks_total, shown = total < 8 ? total : 8;
+    unsigned used = (unsigned)snprintf(row, sizeof row, "plugin opens=%u busy=%u bad=%u closes=%u names=%u foreign=%u/%x starter=%.16s marks=%u:",
+                                       d->opens, d->busy, d->bad, d->closes, d->name_reads, d->foreign_opens, d->foreign_type, d->starter[0], total);
+    for (unsigned i = 0; i < shown && used < sizeof row; ++i)
+      used += (unsigned)snprintf(row + used, sizeof row - used, " %x", d->marks[(total - shown + i) & 15]);
+    stack_row(1, row);
+    snprintf(row, sizeof row, "plugin report %.63s | %.63s", d->report, d->report2);
+    stack_row(2, row);
+  }
+  if (&native_adreno_client_log) {
+    unsigned used = (unsigned)snprintf(row, sizeof row, "clients");
+    for (unsigned i = 0; i < 8 && native_adreno_client_log[i].name[0] && used < sizeof row; ++i) {
+      const struct native_adreno_client_record *r = &native_adreno_client_log[i];
+      used += (unsigned)snprintf(row + used, sizeof row - used, " %.19s %u/%u/%u s%d %uM r%x", r->name, r->opens, r->refused, r->closes,
+                                 r->slot < 8 ? (int)r->slot : -1, r->peak_mib, r->last_refusal);
+    }
+    stack_row(3, row);
+  }
+  if (&native_adreno_open_log_count && native_adreno_open_log_count) {
+    const unsigned count = native_adreno_open_log_count, shown = count < 4 ? count : 4;
+    unsigned used = (unsigned)snprintf(row, sizeof row, "opens %u:", count);
+    for (unsigned i = 0; i < shown && used < sizeof row; ++i) {
+      const struct native_adreno_open_record *r = &native_adreno_open_log[(count - 1 - i) & 7];
+      used += (unsigned)snprintf(row + used, sizeof row - used, " %.16s t%x m%x r%x a%x%s", r->name, r->type, r->macf, r->res, r->attach,
+                                 r->foreign ? " F" : "");
+    }
+    stack_row(4, row);
+  }
+  if (&native_gop_wait_stats && native_gop_wait_stats[0]) {
+    snprintf(row, sizeof row, "scanout wait calls=%lu timeouts=%lu asked=%lums | hand-off fallbacks %u last %x early retires %lu failures %lu",
+             native_gop_wait_stats[0], native_gop_wait_stats[1], native_gop_wait_stats[2],
+             &native_legacy_gpu_fallbacks ? native_legacy_gpu_fallbacks : 0, &native_legacy_gpu_last_status ? native_legacy_gpu_last_status : 0,
+             &native_legacy_early_retires ? native_legacy_early_retires : 0, &native_legacy_early_failures ? native_legacy_early_failures : 0);
+    stack_row(5, row);
+  }
+  if (&native_adreno_fence_wait && native_adreno_fence_wait[0]) {
+    snprintf(row, sizeof row, "fence waits calls=%u timeouts=%u last timed-out fence=%u gpu wrote=%u submitted=%u completed=%u no-job=%u refused=%u",
+             native_adreno_fence_wait[0], native_adreno_fence_wait[1], native_adreno_fence_wait[2], native_adreno_fence_wait[3],
+             native_adreno_fence_wait[4], native_adreno_fence_wait[5], native_adreno_fence_wait[6], native_adreno_fence_wait[7]);
+    stack_row(6, row);
+  }
 }
 
 // The lines sheng's progress page shows for other components (KeyStoreProbe.cpp writes line 0); logged with the display line.
@@ -465,11 +559,13 @@ static void writer(void *argument, int result) {
   for (u32 pass = 1;; ++pass) {
     messages();
     panic_text(0);
-    if (pass % 100 == 0) {display_status(); cpu_status(); touch_status();}
+    if (pass % 100 == 0) {display_status(); cpu_status(); touch_status(); gpu_stack_status();}
     if (pass % 5 == 0) touch_strokes();
     buttons_status();
     gpu_status(pass % 100 == 0);
     if (restart_after && ticks() - start >= limit) {
+      display_status();
+      gpu_stack_status();
       char text[64];
       snprintf(text, sizeof text, "%u s after the zone was mapped (pipa-restart-after)", restart_after);
       line("restart into fastboot: ", text);

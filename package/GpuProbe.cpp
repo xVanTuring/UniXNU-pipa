@@ -25,13 +25,24 @@
 //  10  as 9, then the zap shader (a650_zap.elf of the vendor partition through PAS 13 into the DT's pil_gpu_region@8681a000:
 //      init_image, mem_setup, segment copy, auth_and_reset, UniXNU-tb128fu's zapLoad) and CP_SET_SECURE_MODE(0) through the
 //      ring, then the GPU interrupt (DT kgsl_3d0_irq: SPI 300, level high) through ArmCpu and a CP_NOP fence that must raise it.
+//  11  as 10, then the GPU for user clients, after UniXNU-tb128fu's naPublish / naSelfTest: NativeAdreno's submission object on
+//      ring 0, the CP always-on counter as the GPU clock, the device published with the A650's facts (kDeviceInfo), and two
+//      rounds of the user-client path from the kernel (open, BOs, an IB of three CP_MEM_WRITEs, its fence, close); then a row
+//      every 2 s with the interrupts, fence waits, submissions and user clients, and the CP's state once it stops moving.
+//  12  as 11, then the staged accelerator for the original Metal discovery (UniXNU-sheng's publishMetal, UniXNU-tb128fu's
+//      naMetal); the Metal plugin and Turnip come from the GPU addon (sheng-gpu-addon=1) and the owner trust module.
 // The rows below go to the kernel log whenever they change (BootRamoops.c). The sequence starts 5 s after the late probe, so the
-// display and the log thread already run if a read hangs the bus. Modes 1-9 ran on the tablet on 2026-10-24; mode 10 has not.
+// display and the log thread already run if a read hangs the bus. Modes 1-10 ran on the tablet on 2026-10-24; 11 and 12 have not.
 #include <IOKit/IOService.h>
 #include <IOKit/IOLib.h>
 #include <IOKit/IOMemoryDescriptor.h>
 #include <IOKit/IOBufferMemoryDescriptor.h>
+#include <IOKit/IOUserClient.h>
+#include <IOKit/IOPlatformExpert.h>
 #include <libkern/c++/OSSharedPtr.h>
+#include <libkern/c++/OSMetaClass.h>
+#include <libkern/c++/OSSymbol.h>
+#include <mach/kmod.h>
 #include <kern/thread.h>
 #include <kern/clock.h>
 #include <pexpert/pexpert.h>
@@ -49,20 +60,46 @@ extern const uint32_t native_gpu_zap_firmware_size __attribute__((weak_import));
 // The physical range XNU manages (osfmk/arm/pmap/pmap.c), the interrupt state, and ArmCpu's SPI attach.
 extern uint64_t vm_first_phys, vm_last_phys;
 boolean_t ml_set_interrupts_enabled(boolean_t);
+boolean_t ml_get_interrupts_enabled(void);
+boolean_t ml_at_interrupt_context(void);
+int get_preemption_level(void);
 IOReturn armcpu_spi_attach(uint32_t intid, bool edge, void (*handler)(void *), void *context, uint32_t *readback, uint64_t *router);
+// The staged AGXAccelerator (drivers/NativeAdreno/NativeAdrenoAccelerator.cpp, build-native-adreno-accelerator.py): its static
+// initializer runs only after the original IOGPUFamily kext has loaded, because the parent metaclass does not exist before that.
+void native_adreno_accelerator_static_init(void) __asm__("__GLOBAL__sub_I_NativeAdrenoAccelerator.cpp");
+IOService *native_adreno_accelerator_allocate(void);
+unsigned native_adreno_accelerator_instance_size(void);
+kern_return_t OSKextLoadKextWithIdentifier(const char *);
+extern kmod_info_t g_kernel_kmod_info;
+// Fence waits that slept until a GPU interrupt or spun.
+volatile uint64_t native_gpu_idle_sleeps, native_gpu_idle_spins;
 }
 #include "NativeAdrenoGmuContext.h"
 #include "NativeAdrenoGpuContext.h"
 #include "NativeAdrenoRing.h"
 #include "NativeAdrenoCpInit.h"
 #include "NativeAdrenoIrq.h"
+#include "NativeAdrenoSubmit.h"
+#include "NativeAdrenoTimer.h"
+#include "NativeAdrenoABI.h"
+#include "NativeAdrenoUserClient.h"
+extern "C" {
+NativeAdrenoVm *NativeAdrenoGpuContextVm();
+IOReturn native_adreno_publish(NativeAdrenoVm *, NativeAdrenoSubmit *, NativeAdrenoRing *, const NativeAdrenoRingClock *,
+                               const NativeAdrenoTimer *, const NativeAdrenoAbiDeviceInfo *, uint32_t, uint32_t);
+uint32_t native_adreno_publish_stats(uint32_t *);
+IOService *native_adreno_published_service();
+extern volatile uint32_t native_adreno_pool_stats[8];
+}
 
 // Rows (at most 119 characters each, as the log copies them): 0 summary, 1 GCC, 2 GPUCC, 3 SMMU, 4-5 GMU clocks, 6-7 GMU state,
 // 8 command DB ARC entries, 9 its BCM entries, 10-12 the gfx, mx and cx level lists, 13 the GMU's SMMU context, 14 the cold
 // start's load, 15 its HFI messages, 16 the GMU state after it, 17 GX power, 18 the GPU's SMMU context, 19 the CP steps, 20 the
-// CP's state after them, 21 the zap shader and the secure-mode exit, 22 the GPU interrupt.
+// CP's state after them, 21 the zap shader and the secure-mode exit, 22 the GPU interrupt, 23 the publication and the user-client
+// rounds, 24 the Metal accelerator, 25 the live counters, 26-27 the CP's state once it stops moving.
 enum {kRowSummary, kRowGcc, kRowGpucc, kRowSmmu, kRowClk, kRowClk2, kRowGmu, kRowGmu2, kRowDbArc, kRowDbBcm, kRowLevels,
-      kRowContext = kRowLevels + 3, kRowLoad, kRowHfi, kRowAfter, kRowGx, kRowGpuCtx, kRowCp, kRowCpState, kRowZap, kRowIrq, kRows};
+      kRowContext = kRowLevels + 3, kRowLoad, kRowHfi, kRowAfter, kRowGx, kRowGpuCtx, kRowCp, kRowCpState, kRowZap, kRowIrq,
+      kRowPublish, kRowMetal, kRowLive, kRowHang, kRowHang2, kRows};
 extern "C" {
 char native_gpu_rows[kRows][120];
 volatile uint32_t native_gpu_changes;
@@ -370,7 +407,21 @@ int naBarrier(void *) {__asm__ volatile("dsb sy" ::: "memory"); return 0;}
 int naPublish(void *, const volatile uint32_t *, size_t) {__asm__ volatile("dsb sy" ::: "memory"); return 0;}
 int naAcquire(void *, volatile uint32_t *, size_t) {__asm__ volatile("dsb sy" ::: "memory"); return 0;}
 uint64_t naNow(void *) {uint64_t us = 0; gmuNow(nullptr, &us); return us;}
-int naIdle(void *) {IODelay(20); return 0;}
+// The fence waits' pause: with the GPU interrupt attached (mode 10) a waiter that may block sleeps until the next GPU interrupt or
+// 100 us, whichever is first; before that, or where it may not block, it spins 20 us (UniXNU-tb128fu, sheng int-143).
+volatile bool gIrqAttached;
+volatile uint32_t gIrqCount, gIrqSeen, gIrqLast, gIrqRepeat, gIrqMasked;
+int naIdle(void *) {
+    if (gIrqAttached && ml_get_interrupts_enabled() && !ml_at_interrupt_context() && get_preemption_level() == 0) {
+        assert_wait_timeout(event_t(&gIrqCount), THREAD_UNINT, 100, NSEC_PER_USEC);
+        thread_block(THREAD_CONTINUE_NULL);
+        native_gpu_idle_sleeps = native_gpu_idle_sleeps + 1;
+    } else {
+        IODelay(20);
+        native_gpu_idle_spins = native_gpu_idle_spins + 1;
+    }
+    return 0;
+}
 void naProgress(uint32_t step) {native_gpu_step = 110 + step;}
 NativeAdrenoRingIo gRio{nullptr, naWrite, naRead, naBarrier};
 NativeAdrenoRingCache gCache{nullptr, naPublish, naAcquire};
@@ -452,7 +503,12 @@ void hwInit() {
     gw(0x050B, 0xffffffff);                                             // RBBM_PERFCTR_GPU_BUSY_MASKED
     gw64(0xE05, 0x0001ffffffffffc0ull);                                 // UCHE_WRITE_RANGE_MAX
     gw64(0xE09, 0x0001fffffffff000ull);                                 // UCHE_TRAP_BASE
-    gw64(0xE07, 0x0001fffffffff000ull);                                 // UCHE_WRITE_THRU_BASE (no GMEM range on the a650 family)
+    gw64(0xE07, 0x0001fffffffff000ull);                                 // UCHE_WRITE_THRU_BASE
+    // UCHE_GMEM_RANGE_MIN/MAX: Linux leaves them out on the a650 family and reports GMEM base 0, but a window at 0 would cover
+    // NativeAdreno's SQE buffer at 0x100000; with base 0 the first Metal frames hung (2026-10-24: RBBM_HANG_DETECT and
+    // UCHE_OOB_ACCESS). The window moves to 16 MiB as on UniXNU-sheng (A740) and UniXNU-tb128fu (A610): see kDeviceInfo.
+    gw64(0xE0B, 0x1000000);
+    gw64(0xE0D, 0x1000000 + 0x120000 - 1);
     gw(0xE18, 0x804); gw(0xE17, 0x4);                                   // UCHE_FILTER_CNTL, UCHE_CACHE_WAYS
     gw(0x8C2, 0x02000140); gw(0x8C1, 0x8040362c);                       // CP_ROQ_THRESHOLDS_2/_1 (a640/a650 family)
     gw(0x8C3, 128);                                                     // CP_MEM_POOL_SIZE
@@ -716,8 +772,7 @@ bool leaveSecure() {
 
 // The GPU interrupt (DT kgsl_3d0_irq: SPI 300, level high = INTID 332). As a6xx_irq: read RBBM_INT_0_STATUS and clear it through
 // RBBM_INT_CLEAR_CMD before anything else, so the level line drops before the EOI; the same status 100000 times in a row masks
-// the GPU interrupts.
-volatile uint32_t gIrqCount, gIrqSeen, gIrqLast, gIrqRepeat, gIrqMasked;
+// the GPU interrupts. Each interrupt wakes the fence waiters (naIdle).
 void gpuIrq(void *) {
     const uint32_t status = gpuRead(0x201);
     if (status) gw(0x37, status);
@@ -726,14 +781,16 @@ void gpuIrq(void *) {
     gIrqSeen = gIrqSeen | status;
     gIrqCount = gIrqCount + 1;
     if (gIrqRepeat > 100000) {gw(0x38, 0); gIrqMasked = 1;}
+    thread_wakeup(event_t(&gIrqCount));
 }
 // The secure-mode fence left CP_CACHE_FLUSH_TS set, so a working line fires as soon as it is enabled; a CP_NOP fence must fire it
 // again.
-void gpuInterrupt() {
+bool gpuInterrupt() {
     native_gpu_step = 140;
     uint32_t readback = 0;
     uint64_t router = ~0ull;
     const IOReturn attached = armcpu_spi_attach(32 + 300, false, gpuIrq, nullptr, &readback, &router);
+    gIrqAttached = attached == kIOReturnSuccess;
     IOSleep(20);
     const uint32_t first = gIrqCount;
     uint32_t nop = 0, fence = 0, seen = 0;
@@ -745,6 +802,268 @@ void gpuInterrupt() {
              static_cast<unsigned>(attached), readback, static_cast<unsigned long long>(router), first, gIrqCount, fenced, gIrqSeen,
              gpuRead(0x201), gIrqMasked);
     changed();
+    return gIrqAttached && fenced;
+}
+
+// Mode 11. Facts for the Vulkan driver: chip id 0x06050002 (Linux adreno_device.c; Turnip's Darwin backend makes GPU id 650 of
+// it), GMEM 1 MiB + 128 KiB at the 16 MiB window hw_init programs (Turnip reads input attachments through it in GMEM passes), the
+// UCHE trap base hw_init writes, the client VA window above the kernel buffers and the GMEM window and below the 2 GiB aperture,
+// and the UBWC facts hw_init programs (highest bank bit 16; swizzle levels 2 and 3, as Linux's default for every A6XX but the
+// A610; four-channel macrotiles, RBBM_NC_MODE_CNTL left at its reset value; UBWC 4.0 of the SM8250).
+const NativeAdrenoAbiDeviceInfo kDeviceInfo = {0x06050002u, 0x120000u, 0x1000000ull, 0x1fffffffff000ull, 0x20000000ull,
+                                               0x60000000ull, 16, 6, 0, 4, NativeAdrenoDeviceClientIova, 0};
+NativeAdrenoSubmit *gSubmit;
+NativeAdrenoTimer *gTimer;
+NativeAdrenoTimeIo gTimerIo{nullptr, naRead};
+extern "C" {
+uint32_t native_gpu_publish[16];   // submit attach, timer attach, publish, user-client rounds (see publishRow)
+}
+void publishRow(const char *what) {
+    const uint32_t *p = native_gpu_publish;
+    snprintf(native_gpu_rows[kRowPublish], sizeof native_gpu_rows[0],
+             "PUBLISH %s submit %x timer %x publish %x | uc %u/%u first %x at %u cpumap %x | rounds %d %d",
+             what, p[0], p[1], p[2], p[3], p[4], p[5], p[6], p[7], int32_t(p[8]), int32_t(p[9]));
+    changed();
+}
+
+// The submission object on ring 0, the CP always-on counter as the GPU clock, and the published device for user clients.
+bool publish() {
+    uint32_t *p = native_gpu_publish;
+    native_gpu_step = 150;
+    NativeAdrenoVm *vm = NativeAdrenoGpuContextVm();
+    gSubmit = new NativeAdrenoSubmit;
+    gTimer = new NativeAdrenoTimer;
+    if (!vm || !gSubmit || !gTimer) {publishRow("no objects"); return false;}
+    p[0] = uint32_t(gSubmit->attach(vm, gRing));
+    p[1] = uint32_t(gTimer->attach(&gTimerIo, NativeAdrenoTimeCp));
+    p[2] = uint32_t(native_adreno_publish(vm, gSubmit, gRing, &gClock, p[1] ? nullptr : gTimer, &kDeviceInfo, 31,
+                                          native_gpu_context.output_bits));
+    publishRow(p[0] || p[2] ? "failed" : "ok");
+    return !p[0] && !p[2];
+}
+
+// The user-client round of UniXNU-tb128fu (sheng wrapperRound): exactly the path a user-space client takes, minus the Mach trap.
+// newUserClient with the plugin's open type (a second open is refused while one is live), the external-method table, two BOs
+// mapped for the GPU and, through BoCpuMap and clientMemoryForType, write-combined for the CPU, an IB of three CP_MEM_WRITEs
+// submitted and waited for, the target read back, then clientClose. p[3..6]: steps passed, steps, first error and its step;
+// p[7]: the first clientMemoryForType status. Returns the matching dwords (of 4) or -1.
+IOReturn ucCall(IOUserClient *uc, uint32_t method, const void *in, void *out) {
+    IOExternalMethodArguments a{};
+    a.version = kIOExternalMethodArgumentsCurrentVersion;
+    a.selector = method;
+    const size_t is = NativeAdrenoUserClient::inputSize(method), os = NativeAdrenoUserClient::outputSize(method);
+    a.structureInput = is ? in : nullptr;
+    a.structureInputSize = uint32_t(is);
+    a.structureOutput = os ? out : nullptr;
+    a.structureOutputSize = uint32_t(os);
+    return uc->externalMethod(method, &a, nullptr, nullptr, nullptr);
+}
+int ucRound(IOService *svc) {
+    uint32_t *p = native_gpu_publish;
+    auto step = [&](IOReturn status) {
+        const uint32_t at = p[4]++;
+        if (!status) ++p[3];
+        else if (!p[5]) {p[5] = uint32_t(status); p[6] = at;}
+        return !status;
+    };
+    constexpr UInt32 kPluginOpenType = 0x4147;   // NativeAdrenoPublish.cpp NativeAdrenoPluginOpenType
+    IOUserClient *uc = nullptr;
+    if (!step(svc->newUserClient(kernel_task, nullptr, kPluginOpenType, nullptr, &uc)) || !uc) return -1;
+    IOUserClient *second = nullptr;
+    step(svc->newUserClient(kernel_task, nullptr, kPluginOpenType, nullptr, &second) == kIOReturnBusy ? kIOReturnSuccess
+                                                                                                      : kIOReturnError);
+    if (second) second->release();
+    NativeAdrenoAbiParams params{};
+    step(ucCall(uc, NativeAdrenoMethodQuery, nullptr, &params));
+    NativeAdrenoAbiDeviceInfo info{};
+    step(ucCall(uc, NativeAdrenoMethodGetDeviceInfo, nullptr, &info));
+    step(info.chip_id == kDeviceInfo.chip_id && info.gmem_bytes == kDeviceInfo.gmem_bytes ? kIOReturnSuccess : kIOReturnError);
+    NativeAdrenoAbiBoAlloc alloc{4096, 12, 0};
+    NativeAdrenoAbiBoAllocReply ib{}, tgt{};
+    int matched = -1;
+    IOMemoryDescriptor *desc[2] = {};
+    IOMemoryMap *maps[2] = {};
+    if (step(ucCall(uc, NativeAdrenoMethodBoAlloc, &alloc, &ib)) && step(ucCall(uc, NativeAdrenoMethodBoAlloc, &alloc, &tgt))) {
+        const uint64_t ibIova = 0x20004000, tgtIova = 0x20005000;   // inside the client window of kDeviceInfo
+        NativeAdrenoAbiBoMap mapIb{ib.handle, ibIova, 1, 0, 2, 0}, mapTgt{tgt.handle, tgtIova, 3, 0, 2, 0};
+        NativeAdrenoAbiBoMapReply r{};
+        NativeAdrenoAbiBoCpuMap cmIb{ib.handle}, cmTgt{tgt.handle};
+        NativeAdrenoAbiBoCpuMapReply crIb{}, crTgt{};
+        if (step(ucCall(uc, NativeAdrenoMethodBoMap, &mapIb, &r)) && step(ucCall(uc, NativeAdrenoMethodBoMap, &mapTgt, &r)) &&
+            step(ucCall(uc, NativeAdrenoMethodBoCpuMap, &cmIb, &crIb)) && step(ucCall(uc, NativeAdrenoMethodBoCpuMap, &cmTgt, &crTgt))) {
+            IOOptionBits opt[2] = {};
+            const uint32_t tokens[2] = {crIb.token, crTgt.token};
+            bool mapped = true;
+            for (int i = 0; i < 2; ++i) {
+                const IOReturn status = uc->clientMemoryForType(tokens[i], &opt[i], &desc[i]);
+                if (!p[7]) p[7] = uint32_t(status);
+                if (status || !desc[i]) {mapped = false; continue;}
+                maps[i] = desc[i]->createMappingInTask(kernel_task, 0, opt[i]);
+                if (!maps[i]) {mapped = false; if (!p[7]) p[7] = 0xbad;}
+            }
+            // Type 0 and a stale token must be refused.
+            IOMemoryDescriptor *none = nullptr;
+            IOOptionBits o = 0;
+            step(uc->clientMemoryForType(0, &o, &none) != kIOReturnSuccess && !none ? kIOReturnSuccess : kIOReturnError);
+            step(mapped ? kIOReturnSuccess : kIOReturnNoMemory);
+            if (mapped) {
+                volatile uint32_t *iw = reinterpret_cast<volatile uint32_t *>(maps[0]->getVirtualAddress());
+                volatile uint32_t *tw = reinterpret_cast<volatile uint32_t *>(maps[1]->getVirtualAddress());
+                for (unsigned i = 0; i < 1024; ++i) tw[i] = 0xdeadbeef;
+                const uint32_t values[3] = {0x0badc0deu, 0xfeed0001u, 0x600d0003u};
+                uint32_t words[12];
+                bool built = true;
+                for (unsigned i = 0; i < 3; ++i) {
+                    built = built && AdrenoPM4Type7(0x3d, 3, &words[i * 4]) == AdrenoPM4Success;
+                    words[i * 4 + 1] = uint32_t(tgtIova + i * 4); words[i * 4 + 2] = uint32_t(tgtIova >> 32);
+                    words[i * 4 + 3] = values[i];
+                }
+                for (unsigned i = 0; i < 12; ++i) iw[i] = words[i];
+                __asm__ volatile("dsb sy" ::: "memory");
+                NativeAdrenoAbiSubmit submit{};
+                submit.buffer_count = 1;
+                submit.buffers[0] = {ib.handle, ibIova, sizeof words};
+                NativeAdrenoAbiSubmitReply sr{};
+                if (step(built ? kIOReturnSuccess : kIOReturnInternalError) && step(ucCall(uc, NativeAdrenoMethodSubmit, &submit, &sr))) {
+                    NativeAdrenoAbiWaitFence wait{sr.fence, 200000000ull};
+                    if (step(ucCall(uc, NativeAdrenoMethodWaitFence, &wait, nullptr))) {
+                        __asm__ volatile("dsb sy" ::: "memory");
+                        matched = (tw[0] == values[0]) + (tw[1] == values[1]) + (tw[2] == values[2]) + (tw[3] == 0xdeadbeef);
+                    }
+                }
+                NativeAdrenoAbiTimestamp ts{};
+                step(ucCall(uc, NativeAdrenoMethodGetTimestamp, nullptr, &ts));
+            }
+        }
+    }
+    for (auto *m : maps) if (m) m->release();
+    for (auto *d : desc) if (d) d->release();
+    step(uc->clientClose());
+    uc->release();
+    return matched;
+}
+// Two rounds: the second proves the client slot and the IOVAs recycle after clientClose. pipa-gpu-selftest=0 skips them.
+bool selfTest() {
+    unsigned on = 1;
+    PE_parse_boot_argn("pipa-gpu-selftest", &on, sizeof on);
+    if (!on) return true;
+    native_gpu_step = 155;
+    IOService *svc = native_adreno_published_service();
+    if (!svc) {publishRow("no service"); return false;}
+    native_gpu_publish[8] = uint32_t(ucRound(svc));
+    native_gpu_step = 156;
+    native_gpu_publish[9] = uint32_t(ucRound(svc));
+    const bool ok = native_gpu_publish[8] == 4 && native_gpu_publish[9] == 4;
+    publishRow(ok ? "ok" : "self test failed");
+    return ok;
+}
+
+// Mode 12: the staged AGXAccelerator for the original Metal discovery (sheng publishMetal, UniXNU-tb128fu naMetal). The plugin
+// bundle arrives through the boot-time addon mount (sheng-gpu-addon=1) and the owner trust module; the render server is the one
+// process granted its client, with the two that crashed in CoreImage's OpenGL ES path without a Metal device on UniXNU-tb128fu.
+bool metal() {
+    char *row = native_gpu_rows[kRowMetal];
+    const size_t cap = sizeof native_gpu_rows[0];
+    unsigned stage = 0;
+    auto stop = [&](IOReturn why) {
+        snprintf(row, cap, "METAL stopped at %u: %x", stage, static_cast<unsigned>(why));
+        changed();
+        return false;
+    };
+    native_gpu_step = 160;
+    stage = 1;
+    const kern_return_t kext = OSKextLoadKextWithIdentifier("com.apple.iokit.IOGPUFamily");
+    if (kext) return stop(kext);
+    const OSSymbol *name = OSSymbol::withCString("IOAcceleratorES");
+    const OSMetaClass *parent = name ? OSMetaClass::getMetaClassWithName(name) : nullptr;
+    OSSafeReleaseNULL(name);
+    if (!parent || parent->getClassSize() != 136) return stop(kIOReturnNotFound);
+    stage = 2;
+    void *handle = OSMetaClass::preModLoad(g_kernel_kmod_info.name);
+    if (!handle) return stop(kIOReturnNoResources);
+    native_adreno_accelerator_static_init();
+    const IOReturn loaded = OSMetaClass::postModLoad(handle);
+    if (loaded) return stop(loaded);
+    if (native_adreno_accelerator_instance_size() != 136) return stop(kIOReturnInvalid);
+    stage = 3;
+    IOService *accelerator = native_adreno_accelerator_allocate();
+    if (!accelerator) return stop(kIOReturnNoMemory);
+    if (!accelerator->init()) {accelerator->release(); return stop(kIOReturnError);}
+    accelerator->setProperty("MetalPluginName", "NativeAdrenoMetal");
+    accelerator->setProperty("NativeSandboxGrantProcess", "backboardd,iconservicesagent,Preferences");
+    accelerator->setProperty("MetalPluginClassName", "NativeAdrenoMetalDevice");
+    // Turnip's options for this board, which replace the plugin's default "sysmem,nocb" (NativeAdrenoMetalPlugin.mm
+    // applyBoardTurnipDebug). That default keeps every pass in system memory against a hang of the A740's concurrent binning (BV
+    // and BR); the A650 has no concurrent binning, so by default Turnip picks tiled GMEM rendering with binning or system memory
+    // per pass, as on Linux ("nocb" is a no-op here and keeps the variable non-empty). pipa-turnip-debug=<options> replaces it
+    // for a round, e.g. pipa-turnip-debug=sysmem,nocb.
+    char turnip[64] = "nocb";
+    PE_parse_boot_arg_str("pipa-turnip-debug", turnip, sizeof turnip);
+    accelerator->setProperty("NativeTurnipDebug", turnip);
+    stage = 4;
+    if (!accelerator->attach(IOService::getPlatform())) {accelerator->release(); return stop(kIOReturnNotAttached);}
+    accelerator->registerService();
+    snprintf(row, cap, "METAL ok: accelerator registered (IOGPUFamily loaded, class size 136), Turnip options %s", turnip);
+    changed();
+    return true;
+}
+
+// Where the CP stands when it stops moving. Once a submission is outstanding and RPTR, IB1 base and IB1 remaining dwords are the
+// same as one beat (2 s) before, the rows are refreshed (the ring itself may be drained: RPTR passes an IB's packet when the CP
+// fetches it, before the IB runs; 2026-10-24's hang left RPTR = WPTR). The first row: RBBM_STATUS..STATUS3 (0x210..0x213), CP_RB_RPTR/WPTR,
+// IB1 and IB2 base and remaining dwords (0x928/0x92a, 0x92b/0x92d), CP_HW_FAULT 0x821, CP_INTERRUPT_STATUS 0x823,
+// CP_PROTECT_STATUS 0x824. The second: the SQE PC and the header of the packet it is on (CP_SQE_STAT_ADDR 0x908 = 0, then
+// CP_SQE_STAT_DATA 0x909 twice, as crashdec reads them), context bank 0 FSR, FAR and FSYNR0, and the IB positions of the first
+// beat that saw the stall, so two log periods tell a stuck CP from a slow one.
+void hangRows(unsigned t) {
+    static unsigned firstT;
+    static uint64_t firstIb1, firstIb2;
+    static uint32_t firstRem1, firstRem2;
+    static bool seen;
+    const uint64_t ib1 = gpuRead(0x928) | uint64_t(gpuRead(0x929)) << 32, ib2 = gpuRead(0x92b) | uint64_t(gpuRead(0x92c)) << 32;
+    const uint32_t rem1 = gpuRead(0x92a), rem2 = gpuRead(0x92d);
+    if (!seen) {seen = true; firstT = t; firstIb1 = ib1; firstIb2 = ib2; firstRem1 = rem1; firstRem2 = rem2;}
+    snprintf(native_gpu_rows[kRowHang], sizeof native_gpu_rows[0],
+        "HANG st%08x %x/%x/%x r%x/%x | ib1 %llx+%x ib2 %llx+%x | hw%x cpi%x prot%x", gpuRead(0x210), gpuRead(0x211),
+        gpuRead(0x212), gpuRead(0x213), gpuRead(0x806), gpuRead(0x807), (unsigned long long)ib1, rem1, (unsigned long long)ib2, rem2,
+        gpuRead(0x821), gpuRead(0x823), gpuRead(0x824));
+    gw(0x908, 0);
+    const uint32_t pc = gpuRead(0x909), op = gpuRead(0x909);
+    const uint32_t bank0 = smmuBank0();
+    snprintf(native_gpu_rows[kRowHang2], sizeof native_gpu_rows[0],
+        "HANG sqe pc%x op%08x | fsr%x far%08x%08x fsynr%x | first t%u ib1 %llx+%x ib2 %llx+%x", pc, op, smmuRead(bank0 + 0x58),
+        smmuRead(bank0 + 0x64), smmuRead(bank0 + 0x60), smmuRead(bank0 + 0x68), firstT, (unsigned long long)firstIb1, firstRem1,
+        (unsigned long long)firstIb2, firstRem2);
+    changed();
+}
+
+// The live row, every 2 s once the device is published: interrupts (count, last status, all seen, masked), fence waits that slept
+// or spun, submissions (submitted, completed, timeouts, poisoned), user clients opened/closed, BO pool use. Only changed values
+// reach the log.
+[[noreturn]] void heartbeat() {
+    uint32_t lastRptr = ~0u, lastIb1 = ~0u, lastRem1 = ~0u;
+    for (unsigned t = 0;; t += 2) {
+        const NativeAdrenoSubmitStats st = gSubmit->stats();
+        const uint32_t rptr = gpuRead(0x806), ib1 = gpuRead(0x928), rem1 = gpuRead(0x92a);
+        if (st.submissions != st.completed && rptr == lastRptr && ib1 == lastIb1 && rem1 == lastRem1) hangRows(t);
+        lastRptr = rptr; lastIb1 = ib1; lastRem1 = rem1;
+        uint32_t closed = 0;
+        const uint32_t opened = native_adreno_publish_stats(&closed);
+        char line[sizeof native_gpu_rows[0]];
+        snprintf(line, sizeof line,
+            "LIVE irq%u last%x seen%x m%u | idle %llu/%llu | sub %u/%u t%u p%u | uc %u/%u | pool %u/%u MiB",
+            gIrqCount, gIrqLast, gIrqSeen, gIrqMasked, (unsigned long long)native_gpu_idle_sleeps,
+            (unsigned long long)native_gpu_idle_spins, st.submissions, st.completed, st.timeouts, st.poisoned_jobs, opened, closed,
+            native_adreno_pool_stats[3], native_adreno_pool_stats[0]);
+        // The idle counters move on every fence wait: refresh the row only when the work itself changed.
+        static uint32_t lastSub = ~0u, lastOpened = ~0u, lastIrqMasked = ~0u;
+        if (st.submissions != lastSub || opened != lastOpened || gIrqMasked != lastIrqMasked || t % 30 == 0) {
+            strlcpy(native_gpu_rows[kRowLive], line, sizeof native_gpu_rows[0]);
+            lastSub = st.submissions; lastOpened = opened; lastIrqMasked = gIrqMasked;
+            changed();
+        }
+        IOSleep(2000);
+    }
 }
 
 void gpuThread(void *, wait_result_t) {
@@ -776,7 +1095,12 @@ void gpuThread(void *, wait_result_t) {
     if (gMode >= 7) gmuColdStart(r, native_gpu_clocks);
     if (gMode >= 8 && gColdOk) gxOn();
     const bool cp = gMode >= 9 && native_gpu_gx.gx_on && gpuContext() && cpStart();
-    if (gMode >= 10 && cp && leaveSecure()) gpuInterrupt();
+    const bool irq = gMode >= 10 && cp && leaveSecure() && gpuInterrupt();
+    if (gMode >= 11 && irq && publish()) {
+        if (selfTest() && gMode >= 12) metal();
+        native_gpu_step = 99;
+        heartbeat();
+    }
     native_gpu_step = 99;
 }
 }  // namespace
@@ -784,7 +1108,7 @@ void gpuThread(void *, wait_result_t) {
 extern "C" void native_gpu_probe(void) {
     unsigned mode = 0;
     if (gMode || !PE_parse_boot_argn("pipa-gpu", &mode, sizeof mode) || !mode) return;
-    gMode = mode > 10 ? 10 : mode;
+    gMode = mode > 12 ? 12 : mode;
     thread_t thread = nullptr;
     if (kernel_thread_start(gpuThread, nullptr, &thread) == KERN_SUCCESS) thread_deallocate(thread);
 }
