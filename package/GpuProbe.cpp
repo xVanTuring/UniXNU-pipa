@@ -32,7 +32,8 @@
 //  12  as 11, then the staged accelerator for the original Metal discovery (UniXNU-sheng's publishMetal, UniXNU-tb128fu's
 //      naMetal); the Metal plugin and Turnip come from the GPU addon (sheng-gpu-addon=1) and the owner trust module.
 // The rows below go to the kernel log whenever they change (BootRamoops.c). The sequence starts 5 s after the late probe, so the
-// display and the log thread already run if a read hangs the bus. Modes 1-10 ran on the tablet on 2026-10-24; 11 and 12 have not.
+// display and the log thread already run if a read hangs the bus. Modes 1-12 ran on the tablet on 2026-10-24; with 12 the frames are
+// all zero (every UCHE read ends in UCHE_OOB_ACCESS, see the README).
 #include <IOKit/IOService.h>
 #include <IOKit/IOLib.h>
 #include <IOKit/IOMemoryDescriptor.h>
@@ -96,10 +97,11 @@ extern volatile uint32_t native_adreno_pool_stats[8];
 // 8 command DB ARC entries, 9 its BCM entries, 10-12 the gfx, mx and cx level lists, 13 the GMU's SMMU context, 14 the cold
 // start's load, 15 its HFI messages, 16 the GMU state after it, 17 GX power, 18 the GPU's SMMU context, 19 the CP steps, 20 the
 // CP's state after them, 21 the zap shader and the secure-mode exit, 22 the GPU interrupt, 23 the publication and the user-client
-// rounds, 24 the Metal accelerator, 25 the live counters, 26-27 the CP's state once it stops moving.
+// rounds, 24 the Metal accelerator, 25 the live counters, 26-27 the CP's state once it stops moving, 28 the GPU SMMU's faults,
+// 29 the UCHE and UBWC registers as read back.
 enum {kRowSummary, kRowGcc, kRowGpucc, kRowSmmu, kRowClk, kRowClk2, kRowGmu, kRowGmu2, kRowDbArc, kRowDbBcm, kRowLevels,
       kRowContext = kRowLevels + 3, kRowLoad, kRowHfi, kRowAfter, kRowGx, kRowGpuCtx, kRowCp, kRowCpState, kRowZap, kRowIrq,
-      kRowPublish, kRowMetal, kRowLive, kRowHang, kRowHang2, kRows};
+      kRowPublish, kRowMetal, kRowLive, kRowHang, kRowHang2, kRowFaults, kRowUche, kRows};
 extern "C" {
 char native_gpu_rows[kRows][120];
 volatile uint32_t native_gpu_changes;
@@ -489,8 +491,49 @@ constexpr uint32_t kProtect[] = {
 constexpr unsigned kProtectCount = sizeof kProtect / sizeof kProtect[0];
 static_assert(kProtectCount == 39, "a650_protect has 39 entries");
 
+// pipa-gpu-gmem16m=1: the UCHE GMEM window at 16 MiB and reported there (the rounds before this), instead of Linux's base 0.
+bool gUcheGmem16M;
+
+// Linux v6.6 a650_hwcg (a6xx_gpu.c), as register offsets of a6xx.xml.
+constexpr uint32_t kHwcg[][2] = {
+    {0x00b0, 0x02222222}, {0x00b4, 0x02222220}, {0x00b8, 0x00000080}, {0x00bc, 0x0000f3cf},   // SP0 CNTL, CNTL2, DELAY, HYST
+    {0x00c0, 0x02222222}, {0x00c4, 0x22222222}, {0x00c8, 0x22222222}, {0x00cc, 0x00022222},   // TP0 CNTL..CNTL4
+    {0x00d0, 0x11111111}, {0x00d4, 0x11111111}, {0x00d8, 0x11111111}, {0x00dc, 0x00011111},   // TP0 DELAY..DELAY4
+    {0x00e0, 0x77777777}, {0x00e4, 0x77777777}, {0x00e8, 0x77777777}, {0x00ec, 0x00077777},   // TP0 HYST..HYST4
+    {0x00f0, 0x22222222}, {0x00f4, 0x01002222}, {0x00f8, 0x00002220}, {0x0100, 0x00040f00},   // RB0 CNTL, CNTL2, CCU0, RB_CCU0 HYST
+    {0x0104, 0x25222022}, {0x0105, 0x00005555}, {0x0106, 0x00000011}, {0x0107, 0x00445044},   // RAC CNTL, CNTL2, DELAY, HYST
+    {0x0108, 0x04222222}, {0x0111, 0x00002222}, {0x0114, 0x00222222}, {0x0117, 0x00000002},   // TSE_RAS_RBBM, MODE VFD, GPC, DELAY HLSQ_2
+    {0x011b, 0x00002222}, {0x0109, 0x00004000}, {0x0112, 0x00002222}, {0x0115, 0x00000200},   // MODE HLSQ, DELAY TSE_RAS_RBBM, VFD, GPC
+    {0x011c, 0x00000000}, {0x010a, 0x00000000}, {0x0113, 0x00000000}, {0x0116, 0x04104004},   // DELAY HLSQ, HYST TSE_RAS_RBBM, VFD, GPC
+    {0x011d, 0x00000000}, {0x0120, 0x00000222}, {0x0121, 0x00000111}, {0x0122, 0x00000777},   // HYST HLSQ, TEX_FCHE CNTL, DELAY, HYST
+    {0x010b, 0x22222222}, {0x0110, 0x00000004}, {0x010f, 0x00000002}, {0x0533, 0x00000182},   // UCHE CNTL, HYST, DELAY; ISDB_CNT
+    {0x0044, 0x00000000}, {0x0042, 0x00000000}, {0x0118, 0x00000222}, {0x0119, 0x00000111},   // RAC_THRESHOLD, SP_HYST; GMU_GX CNTL, DELAY
+    {0x011a, 0x00000555},                                                                     // GMU_GX HYST
+};
+static_assert(sizeof kHwcg / sizeof kHwcg[0] == 49, "a650_hwcg has 49 entries");
+
+// a6xx_set_hwcg of Linux v6.6: with the SP clock off (GPU_GMU_GX_SPTPRAC_CLOCK_CONTROL bit 0), the table or zeros, then the SP clock
+// on and RBBM_CLOCK_CNTL. Without it (2026-10-24, before this) nothing that runs a shader wrote anything: the plugin's Turnip check
+// filled a buffer correctly (no shader) but its compute shader wrote no word and its triangle no pixel ("T s0 r0 v512 c0 g0/4096"),
+// and the UI's frames were all zero. pipa-gpu-hwcg=0 writes zeros (no gating, the clocks run) instead of the table.
+void setHwcg() {
+    uint32_t *n = native_gpu_cp;
+    unsigned on = 1;
+    PE_parse_boot_argn("pipa-gpu-hwcg", &on, sizeof on);
+    n[9] = gpuRead(0x00ae);                                             // RBBM_CLOCK_CNTL as found
+    gmuRead(nullptr, A650GmuCore, 0x80 * 4, &n[10]);                     // GPU_GMU_GX_SPTPRAC_CLOCK_CONTROL as found
+    gmuWrite(nullptr, A650GmuCore, 0x80 * 4, n[10] & ~1u);
+    for (const auto &r : kHwcg) gw(r[0], on ? r[1] : 0);
+    uint32_t sptp = 0;
+    gmuRead(nullptr, A650GmuCore, 0x80 * 4, &sptp);
+    gmuWrite(nullptr, A650GmuCore, 0x80 * 4, sptp | 1u);
+    gw(0x00ae, on ? 0x8aa8aa82 : 0);                                    // RBBM_CLOCK_CNTL
+    gmuRead(nullptr, A650GmuCore, 0x80 * 4, &n[11]);
+    n[12] = gpuRead(0x00ae);
+}
+
 // hw_init of Linux v6.6 a6xx_gpu.c for the A650 (a650 family, with a GMU); register offsets from a6xx.xml / a6xx_gmu.xml.
-// Hardware clock gating is left off (the clocks run), APRIV is not enabled (the ring uses NO_UPDATE as on the A610).
+// Hardware clock gating as Linux (setHwcg); APRIV is not enabled (the ring uses NO_UPDATE as on the A610).
 void hwInit() {
     gw(0x3C45, 0); (void)gpuRead(0x3C45);                               // GBIF_HALT
     gw(0x0016, 0); (void)gpuRead(0x0016);                               // RBBM_GBIF_HALT
@@ -498,17 +541,21 @@ void hwInit() {
     gw64(0xF800, 0); gw(0xF802, 0);                                     // TSB_TRUSTED_BASE, _SIZE: no trusted range
     static const uint32_t addrMode[] = {0x842, 0xC01, 0x8601, 0x8E05, 0x9E01, 0xBE05, 0xA601, 0x9601, 0xE00, 0xAE01, 0xB601, 0xF810};
     for (uint32_t reg : addrMode) gw(reg, 1);                           // *_ADDR_MODE_CNTL: 64-bit
+    setHwcg();
+    unsigned gmem16m = 0;
+    PE_parse_boot_argn("pipa-gpu-gmem16m", &gmem16m, sizeof gmem16m);
+    gUcheGmem16M = gmem16m != 0;
     for (uint32_t reg = 0x3C03; reg <= 0x3C06; ++reg) gw(reg, 0x00071620);   // GBIF_QSB_SIDE0..3 (a650 family)
     gw(0x0011, 0x3);                                                    // RBBM_GBIF_CLIENT_QOS_CNTL
     gw(0x050B, 0xffffffff);                                             // RBBM_PERFCTR_GPU_BUSY_MASKED
     gw64(0xE05, 0x0001ffffffffffc0ull);                                 // UCHE_WRITE_RANGE_MAX
     gw64(0xE09, 0x0001fffffffff000ull);                                 // UCHE_TRAP_BASE
     gw64(0xE07, 0x0001fffffffff000ull);                                 // UCHE_WRITE_THRU_BASE
-    // UCHE_GMEM_RANGE_MIN/MAX: Linux leaves them out on the a650 family and reports GMEM base 0, but a window at 0 would cover
-    // NativeAdreno's SQE buffer at 0x100000; with base 0 the first Metal frames hung (2026-10-24: RBBM_HANG_DETECT and
-    // UCHE_OOB_ACCESS). The window moves to 16 MiB as on UniXNU-sheng (A740) and UniXNU-tb128fu (A610): see kDeviceInfo.
-    gw64(0xE0B, 0x1000000);
-    gw64(0xE0D, 0x1000000 + 0x120000 - 1);
+    // UCHE_GMEM_RANGE_MIN/MAX are left alone, as Linux does on the a650 family (GMEM base 0, kDeviceInfo); NativeAdreno's kernel
+    // buffers now lie at 32 MiB and up, outside that window (drivers/NativeAdreno NativeAdrenoGpuContext.h). With the window
+    // moved to 16 MiB instead (as on UniXNU-sheng and UniXNU-tb128fu) every shader access still ended in UCHE_OOB_ACCESS
+    // (2026-10-24: Turnip's check filled a buffer but its compute shader wrote nothing and its triangle drew nothing).
+    if (gUcheGmem16M) {gw64(0xE0B, 0x1000000); gw64(0xE0D, 0x1000000 + 0x120000 - 1);}
     gw(0xE18, 0x804); gw(0xE17, 0x4);                                   // UCHE_FILTER_CNTL, UCHE_CACHE_WAYS
     gw(0x8C2, 0x02000140); gw(0x8C1, 0x8040362c);                       // CP_ROQ_THRESHOLDS_2/_1 (a640/a650 family)
     gw(0x8C3, 128);                                                     // CP_MEM_POOL_SIZE
@@ -537,14 +584,30 @@ void hwInit() {
     gw(0x038, NativeAdrenoIrq::maskA6xx());                             // RBBM_INT_0_MASK: A6XX_INT_MASK
 }
 
+// The UCHE's registers as read back (UCHE_MODE_CNTL, WRITE_RANGE_MAX, WRITE_THRU_BASE, TRAP_BASE, GMEM_RANGE_MIN/MAX, 0E12,
+// CLIENT_PF) and the NC_MODE_CNTL of RB, TPL1, SP and RBBM: right after hw_init, and again from the live loop when they change
+// (Turnip's command streams write some of them). Shader accesses ended in UCHE_OOB_ACCESS (2026-10-24).
+void ucheRow() {
+    auto r64 = [](uint32_t dword) {return uint64_t(gpuRead(dword)) | uint64_t(gpuRead(dword + 1)) << 32;};
+    char line[sizeof native_gpu_rows[0]];
+    snprintf(line, sizeof line, "UCHE m%x w%llx t%llx/%llx g%llx-%llx 0e12 %x pf %x | nc %x %x %x %x",
+             gpuRead(0xE01), (unsigned long long)r64(0xE05), (unsigned long long)r64(0xE07), (unsigned long long)r64(0xE09),
+             (unsigned long long)r64(0xE0B), (unsigned long long)r64(0xE0D), gpuRead(0xE12), gpuRead(0xE19), gpuRead(0x8E08),
+             gpuRead(0xB604), gpuRead(0xAE02), gpuRead(0x534));
+    if (strncmp(line, native_gpu_rows[kRowUche], sizeof line)) {
+        strlcpy(native_gpu_rows[kRowUche], line, sizeof native_gpu_rows[0]);
+        changed();
+    }
+}
+
 // SQE, hw_init, ring 0, CP_ME_INIT, then a CP_MEM_WRITE into the scratch page that the CPU reads back.
 bool cpStart() {
     uint32_t *n = native_gpu_cp;
     char *row = native_gpu_rows[kRowCp], *state = native_gpu_rows[kRowCpState];
     const size_t cap = sizeof native_gpu_rows[0];
     auto report = [&](const char *what) {
-        snprintf(row, cap, "CP %s step %u sqe %u/%u ring %x init %x fence %x/%u write %x marker %08x", what, n[0], n[1], n[2], n[3],
-                 n[4], n[5], n[6], n[7], n[8]);
+        snprintf(row, cap, "CP %s step %u sqe %u/%u ring %x init %x fence %x/%u write %x marker %08x | hwcg %x>%x sptp %x>%x", what, n[0],
+                 n[1], n[2], n[3], n[4], n[5], n[6], n[7], n[8], n[9], n[12], n[10], n[11]);
         // RBBM_STATUS, CP_RB_RPTR, CP_RB_WPTR, CP_HW_FAULT, CP_INTERRUPT_STATUS, RBBM_INT_0_STATUS, SMMU CB0 FSR and FAR
         const uint32_t bank0 = smmuBank0();
         snprintf(state, cap, "CPSTATE rbbm %08x rptr %x wptr %x hwfault %x cpint %x int0 %08x cb0 fsr %08x far %08x%08x",
@@ -576,6 +639,7 @@ bool cpStart() {
     if (n[2]) {report("sqe readback"); return false;}
     n[0] = 3; native_gpu_step = 121;
     hwInit();
+    ucheRow();
     gw64(0x830, gNb[0].iova);                                           // CP_SQE_INSTR_BASE, before CP_SQE_CNTL
     // Ring 0: 32 KiB at its IOVA, the memptrs page for the fence; A6XX forms (NO_UPDATE, CACHE_FLUSH_TS fences).
     n[0] = 4; native_gpu_step = 122;
@@ -806,12 +870,13 @@ bool gpuInterrupt() {
 }
 
 // Mode 11. Facts for the Vulkan driver: chip id 0x06050002 (Linux adreno_device.c; Turnip's Darwin backend makes GPU id 650 of
-// it), GMEM 1 MiB + 128 KiB at the 16 MiB window hw_init programs (Turnip reads input attachments through it in GMEM passes), the
-// UCHE trap base hw_init writes, the client VA window above the kernel buffers and the GMEM window and below the 2 GiB aperture,
-// and the UBWC facts hw_init programs (highest bank bit 16; swizzle levels 2 and 3, as Linux's default for every A6XX but the
-// A610; four-channel macrotiles, RBBM_NC_MODE_CNTL left at its reset value; UBWC 4.0 of the SM8250).
-const NativeAdrenoAbiDeviceInfo kDeviceInfo = {0x06050002u, 0x120000u, 0x1000000ull, 0x1fffffffff000ull, 0x20000000ull,
-                                               0x60000000ull, 16, 6, 0, 4, NativeAdrenoDeviceClientIova, 0};
+// it), GMEM 1 MiB + 128 KiB at base 0 as Linux reports it for the a650 family (Turnip reads input attachments through it in GMEM
+// passes; 16 MiB with pipa-gpu-gmem16m=1), the UCHE trap base hw_init writes, the client VA window above the kernel buffers and
+// below the 2 GiB aperture, and the UBWC facts hw_init programs (highest bank bit 16; swizzle levels 2 and 3, as Linux's default
+// for every A6XX but the A610; eight-channel macrotiles: RBBM_NC_MODE_CNTL reads 1 at reset here (2026-10-24), and Linux's
+// ubwc_config for the SM8250 has macrotile_mode set; UBWC 4.0 of the SM8250).
+NativeAdrenoAbiDeviceInfo kDeviceInfo = {0x06050002u, 0x120000u, 0, 0x1fffffffff000ull, 0x20000000ull, 0x60000000ull,
+                                         16, 6, 1, 4, NativeAdrenoDeviceClientIova, 0};
 NativeAdrenoSubmit *gSubmit;
 NativeAdrenoTimer *gTimer;
 NativeAdrenoTimeIo gTimerIo{nullptr, naRead};
@@ -834,6 +899,7 @@ bool publish() {
     gSubmit = new NativeAdrenoSubmit;
     gTimer = new NativeAdrenoTimer;
     if (!vm || !gSubmit || !gTimer) {publishRow("no objects"); return false;}
+    kDeviceInfo.gmem_base = gUcheGmem16M ? 0x1000000 : 0;
     p[0] = uint32_t(gSubmit->attach(vm, gRing));
     p[1] = uint32_t(gTimer->attach(&gTimerIo, NativeAdrenoTimeCp));
     p[2] = uint32_t(native_adreno_publish(vm, gSubmit, gRing, &gClock, p[1] ? nullptr : gTimer, &kDeviceInfo, 31,
@@ -1062,6 +1128,19 @@ void hangRows(unsigned t) {
             lastSub = st.submissions; lastOpened = opened; lastIrqMasked = gIrqMasked;
             changed();
         }
+        // The GPU SMMU's global and context faults: sCR0 (0x0; USFCFG bit 10: 0 lets a stream no SMR matches through untranslated),
+        // sGFSR (0x48; bit 1 USF, an unidentified stream), sGFSYNR0..2 (0x50..0x58; GFSYNR1's low half the stream id), and context
+        // bank 0's FSR (0x58), FSYNR0 (0x68) and FAR. A stream of the GPU outside its four routes would read and write without a
+        // fault of its context bank.
+        const uint32_t bank0 = smmuBank0();
+        snprintf(line, sizeof line, "FAULTS cr0 %x gfsr %x syn %x/%x/%x | cb0 fsr %x syn %x far %x%08x", smmuRead(0x0), smmuRead(0x48),
+                 smmuRead(0x50), smmuRead(0x54), smmuRead(0x58), smmuRead(bank0 + 0x58), smmuRead(bank0 + 0x68),
+                 smmuRead(bank0 + 0x64), smmuRead(bank0 + 0x60));
+        if (strncmp(line, native_gpu_rows[kRowFaults], sizeof line)) {
+            strlcpy(native_gpu_rows[kRowFaults], line, sizeof native_gpu_rows[0]);
+            changed();
+        }
+        ucheRow();
         IOSleep(2000);
     }
 }

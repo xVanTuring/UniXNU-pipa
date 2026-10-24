@@ -22,3 +22,7 @@
 	path = kits/ArmSmmu4K
 	url = https://github.com/xVanTuring/ArmSmmu4K.git
 	branch = pipa
+[submodule "drivers/NativeMetal"]
+	path = drivers/NativeMetal
+	url = https://github.com/xVanTuring/NativeMetal.git
+	branch = pipa

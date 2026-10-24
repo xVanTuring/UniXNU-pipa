@@ -408,7 +408,7 @@ static void buttons_status(void) {
 // The GPU bring-up (GpuProbe.cpp, pipa-gpu=<mode>): each row whose text changed, and its step every 10 s while it runs (a hang
 // in a register read leaves the step it was at). Once the device is published its live row changes every few seconds; only that
 // row is written then.
-extern char native_gpu_rows[28][120] __attribute__((weak_import));
+extern char native_gpu_rows[30][120] __attribute__((weak_import));
 extern volatile unsigned native_gpu_changes __attribute__((weak_import));
 extern volatile unsigned native_gpu_step __attribute__((weak_import));
 static void gpu_status(int periodic) {
@@ -422,8 +422,8 @@ static void gpu_status(int periodic) {
   unsigned changes = native_gpu_changes;
   if (changes == logged) return;
   logged = changes;
-  static char last[28][120];
-  for (unsigned i = 0; i < 28; ++i) {
+  static char last[30][120];
+  for (unsigned i = 0; i < 30; ++i) {
     if (!strncmp(last[i], native_gpu_rows[i], sizeof last[i])) continue;
     strlcpy(last[i], native_gpu_rows[i], sizeof last[i]);
     touch_row("gpu: ", last[i], sizeof last[i]);
@@ -516,6 +516,41 @@ static void gpu_stack_status(void) {
   }
 }
 
+// What the frame buffer holds, through the display driver's own kernel mapping of it (the one its CPU copies write; a second
+// mapping of the 20 MiB panic'd: kmem_alloc failed with 3): a 32 x 48 grid of pixels spread over the panel, how many are not
+// black and a sum of them, written when it changes (every 10 s and before a restart). With the GPU hand-off the plugin's copies
+// verified against the surfaces while the panel stayed black (2026-10-24): this tells black frames from frames the panel does not show.
+extern volatile u64 native_legacy_gop_physical __attribute__((weak_import)), native_legacy_gop_bytes __attribute__((weak_import)),
+    native_legacy_gop_virtual __attribute__((weak_import));
+static void framebuffer_status(void) {
+  if (!&native_legacy_gop_physical || !&native_legacy_gop_bytes || !&native_legacy_gop_virtual || !&native_legacy_gop_width ||
+      !&native_legacy_gop_height) return;
+  const u64 phys = native_legacy_gop_physical, bytes = native_legacy_gop_bytes;
+  const u32 width = native_legacy_gop_width, height = native_legacy_gop_height;
+  volatile const u32 *fb = (volatile const u32 *)native_legacy_gop_virtual;
+  static char last[120];
+  char text[120];
+  if (!fb || !width || !height || bytes < (u64)width * 4 * height) {
+    snprintf(text, sizeof text, "not sampled: mapping %lx bytes %lx at %lx, %ux%u", phys, bytes, (u64)fb, width, height);
+    if (strncmp(last, text, sizeof last)) {strlcpy(last, text, sizeof last); line("framebuffer: ", text);}
+    return;
+  }
+  u32 lit = 0, sum = 0, first = 0;
+  for (u32 gy = 0; gy < 48; ++gy) {
+    for (u32 gx = 0; gx < 32; ++gx) {
+      const u32 x = (gx * 2 + 1) * width / 64, y = (gy * 2 + 1) * height / 96;
+      const u32 pixel = fb[(u64)y * width + x];
+      if (pixel & 0x00ffffffu) {if (!lit) first = pixel; ++lit;}
+      sum = sum * 31 + pixel;
+    }
+  }
+  snprintf(text, sizeof text, "%u of 1536 samples not black, sum %08x, first lit %08x (fb %lx, %ux%u)", lit, sum, first, phys,
+           width, height);
+  if (!strncmp(last, text, sizeof last)) return;
+  strlcpy(last, text, sizeof last);
+  line("framebuffer: ", text);
+}
+
 // The lines sheng's progress page shows for other components (KeyStoreProbe.cpp writes line 0); logged with the display line.
 char boot_progress_ext[8][48];
 
@@ -559,13 +594,14 @@ static void writer(void *argument, int result) {
   for (u32 pass = 1;; ++pass) {
     messages();
     panic_text(0);
-    if (pass % 100 == 0) {display_status(); cpu_status(); touch_status(); gpu_stack_status();}
+    if (pass % 100 == 0) {display_status(); cpu_status(); touch_status(); gpu_stack_status(); framebuffer_status();}
     if (pass % 5 == 0) touch_strokes();
     buttons_status();
     gpu_status(pass % 100 == 0);
     if (restart_after && ticks() - start >= limit) {
       display_status();
       gpu_stack_status();
+      framebuffer_status();
       char text[64];
       snprintf(text, sizeof text, "%u s after the zone was mapped (pipa-restart-after)", restart_after);
       line("restart into fastboot: ", text);

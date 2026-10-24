@@ -249,6 +249,9 @@ kernel_args = [
   # 16 MiB alike): CP_DRAW_INDX_OFFSET never finished, RBBM_HANG_DETECT after UCHE_OOB_ACCESS, no SMMU fault. In system memory
   # every submission completed.
   "pipa-turnip-debug=sysmem,nocb",
+  # The GPU at its top level, 670 MHz (GX_BW_PERF_VOTE level 7): the plugin's scanout copy of a frame took 5 ms against 12 ms at
+  # 305 MHz (2026-10-24).
+  "pipa-gpu-perf=7",
   # The GPU addon of the payload (the Metal plugin, Turnip, adrenoprobed; scripts/kernel-round.sh passes it) written into the Data
   # volume and mounted before launchd starts; the name is UniXNU-sheng's.
   "sheng-gpu-addon=1",
