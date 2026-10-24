@@ -458,6 +458,13 @@ extern volatile u32 native_adreno_fence_wait[8] __attribute__((weak_import));
 extern volatile u32 native_legacy_gpu_fallbacks __attribute__((weak_import)), native_legacy_gpu_last_status __attribute__((weak_import));
 extern volatile u64 native_legacy_early_retires __attribute__((weak_import)), native_legacy_early_failures __attribute__((weak_import));
 extern char native_adreno_metal_rows[48][96] __attribute__((weak_import));
+// The process pass and the UI processes' stacks (BootProcessProbe.c and BootUiTraceProbe.c, UniXNU-tb128fu's).
+extern void boot_process_capture(void) __attribute__((weak_import));
+extern void boot_process_snapshot(void) __attribute__((weak_import));
+extern char boot_process_rows[10][120] __attribute__((weak_import));
+extern unsigned boot_ui_trace_role_rows(unsigned role, char rows[][120], unsigned max, unsigned detail) __attribute__((weak_import));
+extern unsigned boot_ui_trace_hot_rows(char rows[][120], unsigned max) __attribute__((weak_import));
+extern unsigned long vm_kernel_slide;
 static void stack_row(unsigned index, const char *text) {
   static char last[8][300];
   if (!strncmp(last[index], text, sizeof last[index])) return;
@@ -528,6 +535,46 @@ static void gpu_stack_status(void) {
   }
 }
 
+// The last complete process pass (BootProcessProbe.c: per process its threads, running, waiting, the first thread's state, priority,
+// wait event, continuation and user PC), each row whose text changed; with stacks, also backboardd's and SpringBoard's threads
+// (BootUiTraceProbe.c: the main thread's registers and frames, every thread group's Mach peer, PC, LR and frames, the busiest
+// threads with their kernel frames), as UniXNU-tb128fu's BootLog.c writes them. User addresses are raw (cache+ is the shared cache
+// slide), kernel ones slid by the kernel slide. Two rounds of 2026-10-24 stopped rendering after the first frames without a crash.
+static void process_status(int stacks) {
+  if (!&boot_process_snapshot || !&boot_process_rows) return;
+  boot_process_snapshot();
+  static char last[10][120];
+  for (unsigned i = 0; i < 10; ++i) {
+    if (!boot_process_rows[i][0] || !strncmp(last[i], boot_process_rows[i], sizeof last[i])) continue;
+    strlcpy(last[i], boot_process_rows[i], sizeof last[i]);
+    line("process: ", last[i]);
+  }
+  if (!stacks) return;
+  static char rows[32][120];
+  char head[64];
+  snprintf(head, sizeof head, "kernel slide %lx", vm_kernel_slide);
+  line("stacks: ", head);
+  if (&boot_ui_trace_role_rows)
+    for (unsigned role = 0; role < 4; ++role) {
+      const unsigned n = boot_ui_trace_role_rows(role, rows, 32, 1);
+      for (unsigned i = 0; i < n; ++i) line("stacks: ", rows[i]);
+    }
+  if (&boot_ui_trace_hot_rows) {
+    const unsigned n = boot_ui_trace_hot_rows(rows, 16);
+    for (unsigned i = 0; i < n; ++i) line("stacks: ", rows[i]);
+  }
+}
+// The process pass can wait in proc_iterate and its stack reads can fault in user pages: it runs on a worker of its own every 2 s,
+// from 60 s after the log zone is mapped (the UI processes exist by then); the writer only copies the last complete pass.
+static void process_worker(void *argument, int result) {
+  (void)argument; (void)result;
+  IOSleep(60000);
+  for (;;) {
+    boot_process_capture();
+    IOSleep(2000);
+  }
+}
+
 // What the frame buffer holds, through the display driver's own kernel mapping of it (the one its CPU copies write; a second
 // mapping of the 20 MiB panic'd: kmem_alloc failed with 3): a 32 x 48 grid of pixels spread over the panel, how many are not
 // black and a sum of them, written when it changes (every 10 s and before a restart). With the GPU hand-off the plugin's copies
@@ -561,6 +608,47 @@ static void framebuffer_status(void) {
   if (!strncmp(last, text, sizeof last)) return;
   strlcpy(last, text, sizeof last);
   line("framebuffer: ", text);
+  // The same frame as a 45 x 36 picture of its luma (one character per 40 x 80 pixels, " .:-=+*#%@" from dark to light), to tell
+  // the screens apart in a round nobody watches: the scripted strokes' rounds differed by the screens they turned to (2026-10-24).
+  static const char ramp[] = " .:-=+*#%@";
+  for (u32 cy = 0; cy < 36; ++cy) {
+    char row[48];
+    for (u32 cx = 0; cx < 45; ++cx) {
+      const u32 x = (cx * 2 + 1) * width / 90, y = (cy * 2 + 1) * height / 72;
+      const u32 pixel = fb[(u64)y * width + x];
+      const u32 luma = (((pixel >> 16) & 0xff) * 77 + ((pixel >> 8) & 0xff) * 150 + (pixel & 0xff) * 29) >> 8;
+      row[cx] = ramp[luma * 10 / 256];
+    }
+    row[45] = 0;
+    line("fbpic: ", row);
+  }
+}
+
+// Two 64 x 64 pixel crops of the frame buffer at full resolution, one character per pixel (the same luma ramp): where the home screen's
+// first widget (first page) and first folder (second page) have their top-left corner. The user saw every rounded corner of the
+// Metal-rendered UI drawn wrong (2026-10-24).
+static void framebuffer_crops(void) {
+  if (!&native_legacy_gop_virtual || !&native_legacy_gop_width || !&native_legacy_gop_height || !&native_legacy_gop_bytes) return;
+  const u32 width = native_legacy_gop_width, height = native_legacy_gop_height;
+  volatile const u32 *fb = (volatile const u32 *)native_legacy_gop_virtual;
+  if (!fb || width < 256 || height < 1024 || native_legacy_gop_bytes < (u64)width * 4 * height) return;
+  static const char ramp[] = " .:-=+*#%@";
+  static const u32 origin[2][2] = {{176, 136}, {176, 936}};
+  for (u32 c = 0; c < 2; ++c) {
+    char head[48];
+    snprintf(head, sizeof head, "%ux%u at %u,%u", 64, 64, origin[c][0], origin[c][1]);
+    line("fbcrop: ", head);
+    for (u32 y = 0; y < 64; ++y) {
+      char row[72];
+      for (u32 x = 0; x < 64; ++x) {
+        const u32 pixel = fb[(u64)(origin[c][1] + y) * width + origin[c][0] + x];
+        const u32 luma = (((pixel >> 16) & 0xff) * 77 + ((pixel >> 8) & 0xff) * 150 + (pixel & 0xff) * 29) >> 8;
+        row[x] = ramp[luma * 10 / 256];
+      }
+      row[64] = 0;
+      line("fbcrop: ", row);
+    }
+  }
 }
 
 // The lines sheng's progress page shows for other components (KeyStoreProbe.cpp writes line 0); logged with the display line.
@@ -608,7 +696,8 @@ static void writer(void *argument, int result) {
   for (u32 pass = 1;; ++pass) {
     messages();
     panic_text(0);
-    if (pass % 100 == 0) {display_status(); cpu_status(); touch_status(); gpu_stack_status(); framebuffer_status();}
+    if (pass % 100 == 0) {display_status(); cpu_status(); touch_status(); gpu_stack_status(); framebuffer_status(); process_status(0);}
+    if (pass == 2000) {process_status(1); framebuffer_crops();}   // the UI's stacks and two corner crops 200 s after the zone was mapped
     if (pass % 5 == 0) touch_strokes();
     buttons_status();
     gpu_status(pass % 100 == 0);
@@ -616,6 +705,8 @@ static void writer(void *argument, int result) {
       display_status();
       gpu_stack_status();
       framebuffer_status();
+      process_status(1);
+      framebuffer_crops();
       char text[64];
       snprintf(text, sizeof text, "%u s after the zone was mapped (pipa-restart-after)", restart_after);
       line("restart into fastboot: ", text);
@@ -684,6 +775,7 @@ void boot_progress_start(void) {
   void *thread = 0;
   if (kernel_thread_start(writer, 0, &thread) == 0) thread_deallocate(thread);
   else line("", "message buffer thread NOT started");
+  if (&boot_process_capture && kernel_thread_start(process_worker, 0, &thread) == 0) thread_deallocate(thread);
 }
 
 int boot_progress_active(void) {return 0;}

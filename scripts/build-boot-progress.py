@@ -47,6 +47,16 @@ fault_obj = out / 'BootFaultProbe.o'
 compile_like('osfmk/DEVELOPMENT/startup.o.json', ROOT / 'kits/pipa/BootFaultProbe.c', fault_obj,
              ['-I', str(ROOT / '.cache/xnu-work/osfmk')])
 
+# kits/pipa/BootProcessProbe.c and BootUiTraceProbe.c (UniXNU-tb128fu's, sheng's unchanged): the process pass and the user and
+# kernel stacks of backboardd's and SpringBoard's threads, which BootRamoops.c captures on a worker of its own and logs. They read
+# Mach's task, thread and IPC internals: startup.o's command (osfmk), as BootFaultProbe.c.
+probe_objs = []
+for probe in ('BootProcessProbe', 'BootUiTraceProbe'):
+    probe_obj = out / f'{probe}.o'
+    compile_like('osfmk/DEVELOPMENT/startup.o.json', ROOT / f'kits/pipa/{probe}.c', probe_obj,
+                 ['-I', str(ROOT / '.cache/xnu-work/osfmk')])
+    probe_objs.append(probe_obj)
+
 archive.unlink(missing_ok=True)
-subprocess.run(['xcrun', 'ar', 'rcs', archive, obj, policy_obj, fault_obj], check=True)
+subprocess.run(['xcrun', 'ar', 'rcs', archive, obj, policy_obj, fault_obj, *probe_objs], check=True)
 print(archive)

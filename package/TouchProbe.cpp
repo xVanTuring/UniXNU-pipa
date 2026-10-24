@@ -613,7 +613,7 @@ static void touchThread(void *, wait_result_t) {
 
 // Scripted strokes for runs nobody watches (pipa-touch bits 8 and up: their count), as UniXNU-tb128fu's. Once the GPU hand-off has
 // completed frames (the lock screen is up) and 30 s more have passed, a swipe up from the bottom edge unlocks to the home screen
-// (the user's own unlock swipes of 2026-10-24 ran from HID y 20200 of 20320 to about 15500 in 250 to 360 ms), and 5 s later
+// (the user's own unlock swipes of 2026-10-24 ran from HID y 20200 of 20320 to about 15500 in 250 to 360 ms), and 10 s later
 // strokes alternately right to left and back across the middle of the panel turn its pages, each 300 ms long with 1.5 s between
 // them: one finger in slot 9, which the controller's reports of one finger do not use, in the firmware's units.
 extern "C" volatile uint64_t native_gop_gpu_completions __attribute__((weak_import));
@@ -631,7 +631,9 @@ static void autoTouchThread(void *arg, wait_result_t) {
         IOSleep(10);
     }
     publish(0, nullptr, gAutoInfo);
-    IOSleep(5000);
+    // With 5 s after the unlock some rounds' strokes alternated between the first page and the Today view instead of the first and
+    // second pages (frame buffer pictures, 2026-10-24), presumably because the first page turn (right to left) came too early: 10 s.
+    IOSleep(10000);
     for (unsigned i = 0; i < strokes; ++i) {
         const int from = (i & 1) ? w / 5 : w * 4 / 5, to = (i & 1) ? w * 4 / 5 : w / 5;
         for (int step = 0; step <= 30; ++step) {

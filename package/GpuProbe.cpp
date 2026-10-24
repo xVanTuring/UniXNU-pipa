@@ -1090,6 +1090,13 @@ bool metal() {
     char turnip[64] = "nocb";
     PE_parse_boot_arg_str("pipa-turnip-debug", turnip, sizeof turnip);
     accelerator->setProperty("NativeTurnipDebug", turnip);
+    // Device capabilities the Metal frontend withholds in every process (NativeMetalWithhold, as NMB_WITHHOLD): pipa-metal-withhold=
+    // apple-families answers no to every Apple GPU family, as UniXNU-tb128fu does (Core Animation blends by framebuffer fetch on an
+    // Apple1 device, NativeBridgeMetalFrontend.mm). With the families reported, the home screen's widget platters had their rounded
+    // corners drawn in 4 x 4 pixel blocks with holes (2026-10-24).
+    char withhold[64] = "";
+    if (PE_parse_boot_arg_str("pipa-metal-withhold", withhold, sizeof withhold) && withhold[0])
+        accelerator->setProperty("NativeMetalWithhold", withhold);
     stage = 4;
     if (!accelerator->attach(IOService::getPlatform())) {accelerator->release(); return stop(kIOReturnNotAttached);}
     accelerator->registerService();
@@ -1127,9 +1134,10 @@ void hangRows(unsigned t) {
     changed();
 }
 
-// The live row, every 2 s once the device is published: interrupts (count, last status, all seen, masked), fence waits that slept
-// or spun, submissions (submitted, completed, timeouts, poisoned), user clients opened/closed, BO pool use in MiB, and the GPU's
-// busy share of the last beat in per mille. Only changed values reach the log.
+// The live row, every 2 s once the device is published: interrupts (count, last status, all seen, masked), submissions (submitted,
+// completed, timeouts, poisoned), user clients opened/closed, the BO pool (MiB in use, peak, size; BOs that did not fit and fell
+// back to scattered pages, scattered BOs in all), and the GPU's busy share of the last beat in per mille. Only changed values reach
+// the log. (The fence waits that slept or spun, native_gpu_idle_sleeps/spins, made way for the pool's figures.)
 [[noreturn]] void heartbeat() {
     uint32_t lastRptr = ~0u, lastIb1 = ~0u, lastRem1 = ~0u;
     uint64_t lastBusy = 0, lastNs = 0;
@@ -1156,10 +1164,10 @@ void hangRows(unsigned t) {
         const uint32_t opened = native_adreno_publish_stats(&closed);
         char line[sizeof native_gpu_rows[0]];
         snprintf(line, sizeof line,
-            "LIVE irq%u last%x seen%x m%u | idle %llu/%llu | sub %u/%u t%u p%u | uc %u/%u | pool %u/%u | busy %u",
-            gIrqCount, gIrqLast, gIrqSeen, gIrqMasked, (unsigned long long)native_gpu_idle_sleeps,
-            (unsigned long long)native_gpu_idle_spins, st.submissions, st.completed, st.timeouts, st.poisoned_jobs, opened, closed,
-            native_adreno_pool_stats[3], native_adreno_pool_stats[0], permille);
+            "LIVE irq%u last%x seen%x m%u | sub %u/%u t%u p%u | uc %u/%u | pool %u/%u/%u fb%u sc%u | busy %u",
+            gIrqCount, gIrqLast, gIrqSeen, gIrqMasked, st.submissions, st.completed, st.timeouts, st.poisoned_jobs, opened, closed,
+            native_adreno_pool_stats[3], native_adreno_pool_stats[4], native_adreno_pool_stats[0], native_adreno_pool_stats[2],
+            native_adreno_pool_stats[5], permille);
         // The idle counters move on every fence wait: refresh the row only when the work itself changed.
         static uint32_t lastSub = ~0u, lastOpened = ~0u, lastIrqMasked = ~0u;
         if (st.submissions != lastSub || opened != lastOpened || gIrqMasked != lastIrqMasked || t % 30 == 0) {
