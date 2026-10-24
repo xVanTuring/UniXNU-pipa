@@ -9,8 +9,9 @@
 //      for the reset state and read the firmware info (the coordinate range)
 //   5  read point reports when the attention line (GPIO39, rising edge, latched by the TLMM without an interrupt) fires, and
 //      publish the fingers to NativeHidInput (TouchState.cpp)
+// Bits 8 and up of the value are a count of scripted strokes (autoTouchThread) for runs nobody watches: 10245 is stage 5 and 40.
 // The rows below go to the kernel log every 10 s (BootRamoops.c); the first failure stops the sequence. Board constants and their
-// sources are in TouchBoard.h, the controller protocol in NvtProtocol.c. Nothing here has run on the tablet yet.
+// sources are in TouchBoard.h, the controller protocol in NvtProtocol.c. Stages 1-5 run on the tablet since 2026-10-24.
 #include <IOKit/IOService.h>
 #include <IOKit/IOLib.h>
 #include <IOKit/IOMemoryDescriptor.h>
@@ -477,6 +478,10 @@ bool attention(Session &s) {
 }
 }  // namespace
 
+// The firmware's coordinate range once the report loop runs, for the scripted strokes (autoTouchThread).
+static nvt_fw_info gAutoInfo;
+static volatile bool gAutoReady;
+
 static void touchThread(void *, wait_result_t) {
     Session *s = static_cast<Session *>(IOMallocType(Session));
     if (!s) {fail(0, -12); return;}
@@ -554,6 +559,8 @@ static void touchThread(void *, wait_result_t) {
         if (stage < 5) break;
         armAttention(*s);
         mark(*s, 11);
+        gAutoInfo = s->info;
+        gAutoReady = true;
         uint8_t data[NVT_POINT_DATA_LEN];
         unsigned sinceRead = 0, pass = 0, published = 0;
         unsigned wdt = 0;
@@ -604,12 +611,52 @@ static void touchThread(void *, wait_result_t) {
     rows(*s);
 }
 
+// Scripted strokes for runs nobody watches (pipa-touch bits 8 and up: their count), as UniXNU-tb128fu's. Once the GPU hand-off has
+// completed frames (the lock screen is up) and 30 s more have passed, a swipe up from the bottom edge unlocks to the home screen
+// (the user's own unlock swipes of 2026-10-24 ran from HID y 20200 of 20320 to about 15500 in 250 to 360 ms), and 5 s later
+// strokes alternately right to left and back across the middle of the panel turn its pages, each 300 ms long with 1.5 s between
+// them: one finger in slot 9, which the controller's reports of one finger do not use, in the firmware's units.
+extern "C" volatile uint64_t native_gop_gpu_completions __attribute__((weak_import));
+extern "C" volatile uint32_t native_touch_auto_done;
+volatile uint32_t native_touch_auto_done;
+static void autoTouchThread(void *arg, wait_result_t) {
+    const unsigned strokes = static_cast<unsigned>(reinterpret_cast<uintptr_t>(arg));
+    while (!gAutoReady || !&native_gop_gpu_completions || !native_gop_gpu_completions) IOSleep(1000);
+    IOSleep(30000);
+    const int w = gAutoInfo.abs_x_max, h = gAutoInfo.abs_y_max;
+    // From the panel's last rows, where NativeHidInput marks the contact as an edge one (SpringBoard's home gesture needs it).
+    for (int step = 0; step <= 25; ++step) {
+        const nvt_point p = {9, 1, static_cast<uint16_t>(w / 2), static_cast<uint16_t>(h - h / 300 - (h * 55 / 100) * step / 25), 8, 50};
+        publish(1, &p, gAutoInfo);
+        IOSleep(10);
+    }
+    publish(0, nullptr, gAutoInfo);
+    IOSleep(5000);
+    for (unsigned i = 0; i < strokes; ++i) {
+        const int from = (i & 1) ? w / 5 : w * 4 / 5, to = (i & 1) ? w * 4 / 5 : w / 5;
+        for (int step = 0; step <= 30; ++step) {
+            const nvt_point p = {9, 1, static_cast<uint16_t>(from + (to - from) * step / 30), static_cast<uint16_t>(h / 2), 8, 50};
+            publish(1, &p, gAutoInfo);
+            IOSleep(10);
+        }
+        publish(0, nullptr, gAutoInfo);
+        native_touch_auto_done = i + 1;
+        IOSleep(1500);
+    }
+}
+
 extern "C" void native_touch_probe(void) {
-    unsigned stage = 0;
-    if (!PE_parse_boot_argn("pipa-touch", &stage, sizeof stage) || stage < 1 || native_touch_stage_req) return;
+    unsigned value = 0;
+    if (!PE_parse_boot_argn("pipa-touch", &value, sizeof value) || (value & 0xff) < 1 || native_touch_stage_req) return;
+    unsigned stage = value & 0xff;
     if (stage > 5) stage = 5;
     native_touch_stage_req = stage;
     thread_t thread = nullptr;
     if (kernel_thread_start(touchThread, nullptr, &thread) == KERN_SUCCESS) thread_deallocate(thread);
     else native_touch_error = -12;
+    if (stage == 5 && (value >> 8)) {
+        thread_t automatic = nullptr;
+        if (kernel_thread_start(autoTouchThread, reinterpret_cast<void *>(static_cast<uintptr_t>(value >> 8)), &automatic) == KERN_SUCCESS)
+            thread_deallocate(automatic);
+    }
 }

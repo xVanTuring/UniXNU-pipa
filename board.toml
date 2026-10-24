@@ -245,10 +245,11 @@ kernel_args = [
   # through PAS 13 with CP_SET_SECURE_MODE(0), and the GPU interrupt (SPI 300): all passed on 2026-10-24. Then the device for
   # user clients with two kernel rounds of the user-client path (mode 11), and the staged accelerator for Metal (mode 12).
   "pipa-gpu=12",
-  # Turnip's options (GpuProbe.cpp metal()). In GMEM passes the first Metal frames hung (2026-10-24, the GMEM window at 0 and at
-  # 16 MiB alike): CP_DRAW_INDX_OFFSET never finished, RBBM_HANG_DETECT after UCHE_OOB_ACCESS, no SMMU fault. In system memory
-  # every submission completed.
-  "pipa-turnip-debug=sysmem,nocb",
+  # Turnip's options (GpuProbe.cpp metal()): GMEM or system memory per pass, Turnip's own choice ("nocb" is a no-op on the A650).
+  # Before APRIV the GMEM passes hung on CP_DRAW_INDX_OFFSET (UCHE_OOB_ACCESS); with it 40 scripted strokes over the home screen ran
+  # at 17 to 20 frames a second (2026-10-24). With "sysmem,nocb" the render server stopped committing after the unlock swipe in one
+  # round (7 command buffers, no crash, no GPU work outstanding).
+  "pipa-turnip-debug=nocb",
   # The GPU at its top level, 670 MHz (GX_BW_PERF_VOTE level 7): the plugin's scanout copy of a frame took 5 ms against 12 ms at
   # 305 MHz (2026-10-24).
   "pipa-gpu-perf=7",

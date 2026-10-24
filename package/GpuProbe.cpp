@@ -1128,11 +1128,26 @@ void hangRows(unsigned t) {
 }
 
 // The live row, every 2 s once the device is published: interrupts (count, last status, all seen, masked), fence waits that slept
-// or spun, submissions (submitted, completed, timeouts, poisoned), user clients opened/closed, BO pool use. Only changed values
-// reach the log.
+// or spun, submissions (submitted, completed, timeouts, poisoned), user clients opened/closed, BO pool use in MiB, and the GPU's
+// busy share of the last beat in per mille. Only changed values reach the log.
 [[noreturn]] void heartbeat() {
     uint32_t lastRptr = ~0u, lastIb1 = ~0u, lastRem1 = ~0u;
+    uint64_t lastBusy = 0, lastNs = 0;
     for (unsigned t = 0;; t += 2) {
+        // The GMU's busy counter as Linux's a6xx_gpu_busy reads it: GMU_CX_GMU_POWER_COUNTER_XOCLK_0 (0x5044/0x5045), 19.2 MHz
+        // ticks while the GPU is busy (hw_init writes 0x20, Linux's BIT(5), into POWER_COUNTER_SELECT_0's low byte), against the time
+        // since the last beat.
+        uint32_t lo = 0, hi = 0, hi2 = 0;
+        gmuRead(nullptr, A650GmuCore, 0x5045 * 4, &hi);
+        gmuRead(nullptr, A650GmuCore, 0x5044 * 4, &lo);
+        gmuRead(nullptr, A650GmuCore, 0x5045 * 4, &hi2);
+        if (hi2 != hi) gmuRead(nullptr, A650GmuCore, 0x5044 * 4, &lo);
+        const uint64_t busy = uint64_t(hi2) << 32 | lo;
+        uint64_t ns = 0;
+        absolutetime_to_nanoseconds(mach_absolute_time(), &ns);
+        const uint32_t permille = lastNs && ns > lastNs && busy >= lastBusy
+            ? uint32_t((busy - lastBusy) * 1000000000ull / 19200000ull * 1000 / (ns - lastNs)) : 0;
+        lastBusy = busy; lastNs = ns;
         const NativeAdrenoSubmitStats st = gSubmit->stats();
         const uint32_t rptr = gpuRead(0x806), ib1 = gpuRead(0x928), rem1 = gpuRead(0x92a);
         if (st.submissions != st.completed && rptr == lastRptr && ib1 == lastIb1 && rem1 == lastRem1) hangRows(t);
@@ -1141,10 +1156,10 @@ void hangRows(unsigned t) {
         const uint32_t opened = native_adreno_publish_stats(&closed);
         char line[sizeof native_gpu_rows[0]];
         snprintf(line, sizeof line,
-            "LIVE irq%u last%x seen%x m%u | idle %llu/%llu | sub %u/%u t%u p%u | uc %u/%u | pool %u/%u MiB",
+            "LIVE irq%u last%x seen%x m%u | idle %llu/%llu | sub %u/%u t%u p%u | uc %u/%u | pool %u/%u | busy %u",
             gIrqCount, gIrqLast, gIrqSeen, gIrqMasked, (unsigned long long)native_gpu_idle_sleeps,
             (unsigned long long)native_gpu_idle_spins, st.submissions, st.completed, st.timeouts, st.poisoned_jobs, opened, closed,
-            native_adreno_pool_stats[3], native_adreno_pool_stats[0]);
+            native_adreno_pool_stats[3], native_adreno_pool_stats[0], permille);
         // The idle counters move on every fence wait: refresh the row only when the work itself changed.
         static uint32_t lastSub = ~0u, lastOpened = ~0u, lastIrqMasked = ~0u;
         if (st.submissions != lastSub || opened != lastOpened || gIrqMasked != lastIrqMasked || t % 30 == 0) {

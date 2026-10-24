@@ -456,6 +456,7 @@ extern volatile u64 native_gop_wait_stats[7] __attribute__((weak_import));
 extern volatile u32 native_adreno_fence_wait[8] __attribute__((weak_import));
 extern volatile u32 native_legacy_gpu_fallbacks __attribute__((weak_import)), native_legacy_gpu_last_status __attribute__((weak_import));
 extern volatile u64 native_legacy_early_retires __attribute__((weak_import)), native_legacy_early_failures __attribute__((weak_import));
+extern char native_adreno_metal_rows[48][96] __attribute__((weak_import));
 static void stack_row(unsigned index, const char *text) {
   static char last[8][300];
   if (!strncmp(last[index], text, sizeof last[index])) return;
@@ -513,6 +514,16 @@ static void gpu_stack_status(void) {
              native_adreno_fence_wait[0], native_adreno_fence_wait[1], native_adreno_fence_wait[2], native_adreno_fence_wait[3],
              native_adreno_fence_wait[4], native_adreno_fence_wait[5], native_adreno_fence_wait[6], native_adreno_fence_wait[7]);
     stack_row(6, row);
+  }
+  // The Metal bridge's telemetry table (NativeAdrenoPublish.cpp native_adreno_metal_rows, resent by the plugin every 4 s: commit and
+  // frame timings, pipeline creation, who waits for completion), as UniXNU-tb128fu's BootLog.c writes it: each row whose text changed.
+  if (&native_adreno_metal_rows) {
+    static char last_rows[48][96];
+    for (unsigned r = 0; r < 48; ++r) {
+      if (!native_adreno_metal_rows[r][0] || !strncmp(last_rows[r], native_adreno_metal_rows[r], sizeof last_rows[r])) continue;
+      strlcpy(last_rows[r], native_adreno_metal_rows[r], sizeof last_rows[r]);
+      line("metal table: ", last_rows[r]);
+    }
   }
 }
 
