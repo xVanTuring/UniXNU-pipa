@@ -555,14 +555,17 @@ static void touchThread(void *, wait_result_t) {
         armAttention(*s);
         mark(*s, 11);
         uint8_t data[NVT_POINT_DATA_LEN];
-        unsigned sinceRead = 0, tick = 0;
+        unsigned sinceRead = 0, pass = 0, published = 0;
         unsigned wdt = 0;
         for (;;) {
+            // The rows about every half second, whatever the reports do (the log copies them every 10 s).
+            if (++pass % 250 == 0) rows(*s);
             native_touch_loop_step = 1;
-            // A report when the line rose; without an edge for 50 ms, one anyway (the latch could have been missed, and a lifted
-            // finger needs its empty report).
+            // A report when the line rose; without an edge for 500 ms, one anyway, in case the latch missed one. On the tablet
+            // (2026-10-24) every finger report came with an edge, the lift included (676 edges, 671 reports in 5 strokes), and the
+            // reads without one mostly returned 0xff (a bad checksum); 50 ms read the chip 6385 times in 6 minutes for nothing.
             if (!attention(*s)) {
-                if (++sinceRead < 25) {IOSleep(2); continue;}
+                if (++sinceRead < 250) {IOSleep(2); continue;}
                 ++s->idleReads;
             } else {
                 ++s->edges;
@@ -593,8 +596,9 @@ static void touchThread(void *, wait_result_t) {
             native_touch_contacts = n;
             if (n) {native_touch_last_x = pts[0].x; native_touch_last_y = pts[0].y;}
             native_touch_loop_step = 5;
-            publish(n, pts, s->info);
-            if ((++tick & 63) == 0) rows(*s);
+            // An empty report only once after the last finger lifted: the reads without an edge return empty reports too.
+            if (n || published) publish(n, pts, s->info);
+            published = n;
         }
     } while (0);
     rows(*s);
