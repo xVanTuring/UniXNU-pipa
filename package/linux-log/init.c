@@ -8,7 +8,10 @@
 // reader finds this one's marker if the memory survives the way back. Static and libc-free; nothing on UFS is read or written.
 // Adapted from the TB128FU reader (UniXNU-tb128fu package/linux-log/init.c).
 
-#define TIMEOUT_S  300
+// The host mounts and copies within about 15 s of boot. Some ejects were not seen (2026-10-24, twice: the LUN kept its file), and
+// the tablet came back to fastboot 8.5 to 9 minutes after the reader started, so 300 rounds of this wait take far longer than
+// 300 s; 60 rounds are enough.
+#define TIMEOUT_S  60
 #define BIG        (4 * 1024 * 1024)
 #define GADGET     "/sys/kernel/config/usb_gadget/log"
 #define LUN        GADGET "/functions/mass_storage.0/lun.0"

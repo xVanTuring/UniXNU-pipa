@@ -1186,8 +1186,39 @@ void hangRows(unsigned t) {
     }
 }
 
+// The CPU's memory bandwidth, as a hint of the DDR level: Linux votes the GPU's DDR bandwidth through the interconnect framework
+// (opp-peak-kBps of each GPU level) and the GMU's own table has one "off" level (a650_build_bw_table); this kernel votes nothing,
+// so DDR runs at whatever the firmware left. 32 MiB set with memset and copied with memcpy, the best of three, in MB/s (2026-10-24,
+// two rounds: memset 18.2 and 19.3 GB/s, memcpy 8.4 and 8.1 GB/s).
+void memBench() {
+    constexpr size_t kBytes = 32u << 20;
+    OSSharedPtr<IOBufferMemoryDescriptor> bufA(IOBufferMemoryDescriptor::withCapacity(kBytes, kIODirectionInOut), OSNoRetain);
+    OSSharedPtr<IOBufferMemoryDescriptor> bufB(IOBufferMemoryDescriptor::withCapacity(kBytes, kIODirectionInOut), OSNoRetain);
+    uint8_t *a = bufA ? static_cast<uint8_t *>(bufA->getBytesNoCopy()) : nullptr;
+    uint8_t *b = bufB ? static_cast<uint8_t *>(bufB->getBytesNoCopy()) : nullptr;
+    if (!a || !b) IOLog("gpu mem: no 32 MiB buffers (%d %d)\n", a != nullptr, b != nullptr);
+    if (a && b) {
+        uint64_t best[2] = {~0ull, ~0ull};
+        for (int i = 0; i < 3; ++i) {
+            const uint64_t t0 = mach_absolute_time();
+            memset(a, i + 1, kBytes);
+            const uint64_t t1 = mach_absolute_time();
+            memcpy(b, a, kBytes);
+            const uint64_t t2 = mach_absolute_time();
+            if (t1 - t0 < best[0]) best[0] = t1 - t0;
+            if (t2 - t1 < best[1]) best[1] = t2 - t1;
+        }
+        uint64_t ns[2] = {};
+        absolutetime_to_nanoseconds(best[0], &ns[0]);
+        absolutetime_to_nanoseconds(best[1], &ns[1]);
+        IOLog("gpu mem: memset %llu MB/s, memcpy %llu MB/s (32 MiB, best of 3)\n",
+              ns[0] ? (unsigned long long)(uint64_t(kBytes) * 1000 / ns[0]) : 0ull, ns[1] ? (unsigned long long)(uint64_t(kBytes) * 1000 / ns[1]) : 0ull);
+    }
+}
+
 void gpuThread(void *, wait_result_t) {
     IOSleep(5000);
+    memBench();
     native_gpu_step = 1;
     unsigned have = 0;
     for (unsigned w = 0; w < GPB_WINDOWS; ++w) if (mapWindow(w)) have |= 1u << w;

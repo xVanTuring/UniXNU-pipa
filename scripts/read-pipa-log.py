@@ -93,7 +93,7 @@ def main():
             break
         time.sleep(1)
     if not volume:
-        sys.exit(f'no PIPALOG disk within {a.wait} s (the reader returns to fastboot by itself after 300 s)')
+        sys.exit(f'no PIPALOG disk within {a.wait} s (the reader returns to fastboot by itself within about 2 minutes)')
     print(f'disk {volume} after {time.time() - start:.0f} s')
     run = a.out / time.strftime('%Y%m%d-%H%M%S')
     run.mkdir(parents=True)
