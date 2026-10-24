@@ -236,11 +236,11 @@ kernel_args = [
   # The power and volume keys (package/Buttons.c): the PM8150 PON's and GPIO6's status over SPMI every 10 ms, read only, to the HID
   # input's report 2 (power, volume up, volume down). Each change is logged.
   "pipa-buttons=1",
-  # The Adreno 650 up to its first command (package/GpuProbe.cpp): CX power, the GPU SMMU's clocks, the command DB, the GMU clocks
-  # at 200 MHz, the GMU's SMMU context, the GMU cold start with its HFI startup messages, the GX vote (305 MHz) and GPU_SET, then
-  # the GPU's SMMU context, the A650 hw_init, the SQE, ring 0, CP_ME_INIT and a CP_MEM_WRITE read back. All passed on 2026-10-24
-  # (mode 6 in two rounds, 7, 8 and 9 in one each).
-  "pipa-gpu=9",
+  # The Adreno 650 up to a non-secure GPU with its interrupt (package/GpuProbe.cpp): CX power, the GPU SMMU's clocks, the command
+  # DB, the GMU clocks at 200 MHz, the GMU's SMMU context, the GMU cold start with its HFI startup messages, the GX vote (305 MHz)
+  # and GPU_SET, the GPU's SMMU context, the A650 hw_init, the SQE, ring 0, CP_ME_INIT, a CP_MEM_WRITE read back, the zap shader
+  # through PAS 13 with CP_SET_SECURE_MODE(0), and the GPU interrupt (SPI 300). All passed on 2026-10-24.
+  "pipa-gpu=10",
 ]
 
 [payload.adt]

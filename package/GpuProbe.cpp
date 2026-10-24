@@ -21,12 +21,16 @@
 //      GPU's own SMMU context through NativeAdreno (bank 0 / ASID 2, the GPU's streams 0, 1, 0x400 and 0x401 of its DT iommus
 //      <0 0x401> on SMR 0, 1, 4 and 5; non-coherent table walks), Linux v6.6 hw_init for the A650 (no clock gating, no APRIV),
 //      the SQE (a650_sqe.fw without its first dword), ring 0 with CP_RB_CNTL NO_UPDATE, CP_ME_INIT, then one CP_MEM_WRITE of
-//      a marker into the scratch page that the CPU reads back. The zap shader and the exit from secure mode are not done yet.
+//      a marker into the scratch page that the CPU reads back.
+//  10  as 9, then the zap shader (a650_zap.elf of the vendor partition through PAS 13 into the DT's pil_gpu_region@8681a000:
+//      init_image, mem_setup, segment copy, auth_and_reset, UniXNU-tb128fu's zapLoad) and CP_SET_SECURE_MODE(0) through the
+//      ring, then the GPU interrupt (DT kgsl_3d0_irq: SPI 300, level high) through ArmCpu and a CP_NOP fence that must raise it.
 // The rows below go to the kernel log whenever they change (BootRamoops.c). The sequence starts 5 s after the late probe, so the
-// display and the log thread already run if a read hangs the bus. Modes 1-8 ran on the tablet on 2026-10-24; mode 9 has not.
+// display and the log thread already run if a read hangs the bus. Modes 1-9 ran on the tablet on 2026-10-24; mode 10 has not.
 #include <IOKit/IOService.h>
 #include <IOKit/IOLib.h>
 #include <IOKit/IOMemoryDescriptor.h>
+#include <IOKit/IOBufferMemoryDescriptor.h>
 #include <libkern/c++/OSSharedPtr.h>
 #include <kern/thread.h>
 #include <kern/clock.h>
@@ -39,7 +43,13 @@ extern const uint8_t native_gpu_gmu_firmware[] __attribute__((weak_import));
 extern const uint32_t native_gpu_gmu_firmware_size __attribute__((weak_import));
 extern const uint8_t native_gpu_sqe_firmware[] __attribute__((weak_import));
 extern const uint32_t native_gpu_sqe_firmware_size __attribute__((weak_import));
+extern const uint8_t native_gpu_zap_firmware[] __attribute__((weak_import));
+extern const uint32_t native_gpu_zap_firmware_size __attribute__((weak_import));
 #include "AdrenoPM4.h"
+// The physical range XNU manages (osfmk/arm/pmap/pmap.c), the interrupt state, and ArmCpu's SPI attach.
+extern uint64_t vm_first_phys, vm_last_phys;
+boolean_t ml_set_interrupts_enabled(boolean_t);
+IOReturn armcpu_spi_attach(uint32_t intid, bool edge, void (*handler)(void *), void *context, uint32_t *readback, uint64_t *router);
 }
 #include "NativeAdrenoGmuContext.h"
 #include "NativeAdrenoGpuContext.h"
@@ -50,9 +60,9 @@ extern const uint32_t native_gpu_sqe_firmware_size __attribute__((weak_import));
 // Rows (at most 119 characters each, as the log copies them): 0 summary, 1 GCC, 2 GPUCC, 3 SMMU, 4-5 GMU clocks, 6-7 GMU state,
 // 8 command DB ARC entries, 9 its BCM entries, 10-12 the gfx, mx and cx level lists, 13 the GMU's SMMU context, 14 the cold
 // start's load, 15 its HFI messages, 16 the GMU state after it, 17 GX power, 18 the GPU's SMMU context, 19 the CP steps, 20 the
-// CP's state after them.
+// CP's state after them, 21 the zap shader and the secure-mode exit, 22 the GPU interrupt.
 enum {kRowSummary, kRowGcc, kRowGpucc, kRowSmmu, kRowClk, kRowClk2, kRowGmu, kRowGmu2, kRowDbArc, kRowDbBcm, kRowLevels,
-      kRowContext = kRowLevels + 3, kRowLoad, kRowHfi, kRowAfter, kRowGx, kRowGpuCtx, kRowCp, kRowCpState, kRows};
+      kRowContext = kRowLevels + 3, kRowLoad, kRowHfi, kRowAfter, kRowGx, kRowGpuCtx, kRowCp, kRowCpState, kRowZap, kRowIrq, kRows};
 extern "C" {
 char native_gpu_rows[kRows][120];
 volatile uint32_t native_gpu_changes;
@@ -547,6 +557,196 @@ bool cpStart() {
     return true;
 }
 
+// Mode 10. SIP SMC as UniXNU-tb128fu's scmCall (qcom_scm-smc.c): x0 function, x1 arginfo, x2.. arguments; INTERRUPTED (1)
+// resumes with x0 = 1 and the returned x6, V2_EBUSY (-12) retries after 30 ms up to 20 times. This core's IRQs stay masked
+// across the call and its resumes (tb128fu-022: an unmasked init_image was interrupted 10000 times in a row).
+struct ScmRes {int64_t a0; uint64_t a1;};
+uint32_t gScmResumes;
+ScmRes scmCall(uint64_t fn, uint64_t arginfo, uint64_t p0, uint64_t p1, uint64_t p2) {
+    const boolean_t was = ml_set_interrupts_enabled(FALSE);
+    ScmRes out{-1000, 0};
+    uint64_t first = fn, a6 = 0;
+    gScmResumes = 0;
+    for (unsigned resume = 0, busy = 0; resume < 10000; gScmResumes = resume) {
+        register uint64_t x0 asm("x0") = first, x1 asm("x1") = arginfo, x2 asm("x2") = p0, x3 asm("x3") = p1;
+        register uint64_t x4 asm("x4") = p2, x5 asm("x5") = 0, x6 asm("x6") = a6, x7 asm("x7") = 0;
+        asm volatile("smc #0" : "+r"(x0), "+r"(x1), "+r"(x2), "+r"(x3), "+r"(x4), "+r"(x5), "+r"(x6), "+r"(x7)
+                     :: "x8", "x9", "x10", "x11", "x12", "x13", "x14", "x15", "x16", "x17", "memory");
+        if (x0 == 1) {first = 1; a6 = x6; ++resume; continue;}
+        if (int64_t(x0) == -12 && busy++ < 20) {first = fn; a6 = 0; IODelay(30000); continue;}
+        out = ScmRes{int64_t(x0), x1};
+        break;
+    }
+    ml_set_interrupts_enabled(was);
+    return out;
+}
+// ARM_SMCCC_CALL_VAL(STD, SMC_64, OWNER_SIP, svc << 8 | cmd): PIL is service 2 (qcom_scm.h).
+constexpr uint64_t kScmPil(uint32_t cmd) {return 0x42000000u | (0x02u << 8) | cmd;}
+constexpr uint32_t kGpuPasId = 13;                                  // DT qcom,kgsl-hyp qcom,pas-id
+constexpr uint64_t kZapPhys = 0x8681a000, kZapBytes = 0x2000;       // DT pil_gpu_region@8681a000, no-map
+uint32_t le32(const uint8_t *p) {return uint32_t(p[0]) | uint32_t(p[1]) << 8 | uint32_t(p[2]) << 16 | uint32_t(p[3]) << 24;}
+uint16_t le16(const uint8_t *p) {return uint16_t(p[0] | p[1] << 8);}
+void cleanToPoc(const void *p, size_t len) {
+    uint64_t ctr; __asm__ volatile("mrs %0, ctr_el0" : "=r"(ctr));
+    const size_t line = 4u << ((ctr >> 16) & 15);
+    for (uintptr_t a = reinterpret_cast<uintptr_t>(p) & ~(line - 1); a < reinterpret_cast<uintptr_t>(p) + len; a += line)
+        __asm__ volatile("dc civac, %0" :: "r"(a) : "memory");
+    __asm__ volatile("dsb sy" ::: "memory");
+}
+uint32_t msSince(uint64_t start) {
+    uint64_t ns = 0;
+    absolutetime_to_nanoseconds(mach_absolute_time() - start, &ns);
+    return uint32_t(ns / 1000000);
+}
+extern "C" {
+int32_t native_gpu_zap[16];   // step, init/mem/auth results, resumes, timings, segment facts (see zapRow)
+}
+IOBufferMemoryDescriptor *gZapMeta;
+void zapRow(const char *what) {
+    const int32_t *z = native_gpu_zap;
+    snprintf(native_gpu_rows[kRowZap], sizeof native_gpu_rows[0],
+             "ZAP %s step %d init %x/%x mem %x/%x auth %x/%x resumes %d ms %d/%d/%d phdrs %d reloc %d span %x secure %d meta %x000",
+             what, z[0], z[1], z[2], z[3], z[4], z[5], z[6], z[7], z[8], z[9], z[10], z[11], z[12], z[13], z[14], z[15]);
+    changed();
+}
+// qcom_mdt_load for the zap shader (UniXNU-tb128fu zapLoad): the ELF header and program headers plus the hash segment as
+// metadata for init_image, mem_setup for a relocatable image, the loadable segments copied into the reserved region, then
+// auth_and_reset. z[0] is the step reached (negative: why it stopped).
+bool zapLoad() {
+    int32_t *z = native_gpu_zap;
+    auto stop = [&](int why) {z[0] = why; zapRow("stopped"); return false;};
+    native_gpu_step = 130;
+    z[0] = 1;
+    // The region must not be memory XNU hands out: TrustZone locks it after authentication.
+    if (kZapPhys + kZapBytes > vm_first_phys && kZapPhys < vm_last_phys) return stop(-20);
+    if (!&native_gpu_zap_firmware || !&native_gpu_zap_firmware_size) return stop(-21);
+    const uint8_t *fw = native_gpu_zap_firmware;
+    const uint64_t size = native_gpu_zap_firmware_size;
+    if (size < 52 || fw[0] != 0x7f || fw[1] != 'E' || fw[2] != 'L' || fw[3] != 'F' || fw[4] != 1) return stop(-1);
+    const uint32_t phoff = le32(fw + 28);
+    const unsigned phent = le16(fw + 42), phnum = le16(fw + 44);
+    z[11] = int32_t(phnum);
+    if (phent != 32 || phnum < 2 || phnum > 16 || phoff + uint64_t(phnum) * 32 > size) return stop(-2);
+    auto ph = [&](unsigned i, unsigned field) {return le32(fw + phoff + i * 32 + field * 4);};   // type off va pa filesz memsz flags
+    if (ph(0, 0) == 1) return stop(-3);
+    unsigned hash = 0;
+    for (unsigned i = 1; i < phnum && !hash; ++i) if (((ph(i, 6) >> 24) & 7) == 2) hash = i;
+    if (!hash) return stop(-4);
+    uint64_t lo = ~0ull, hi = 0;
+    bool relocate = false;
+    for (unsigned i = 0; i < phnum; ++i) {
+        if (ph(i, 0) != 1 || ((ph(i, 6) >> 24) & 7) == 2 || !ph(i, 5)) continue;   // mdt_phdr_loadable
+        if (ph(i, 6) & (1u << 27)) relocate = true;
+        lo = lo < ph(i, 3) ? lo : ph(i, 3);
+        const uint64_t end = (uint64_t(ph(i, 3)) + ph(i, 5) + 0xfff) & ~0xfffull;
+        hi = hi > end ? hi : end;
+    }
+    z[12] = relocate; z[13] = int32_t(hi - lo);
+    if (lo >= hi || hi - lo > kZapBytes) return stop(-5);
+    const uint64_t ehdr = ph(0, 4), hashBytes = ph(hash, 4), hashOff = ph(hash, 1);
+    if (ehdr > size || hashOff + hashBytes > size || ehdr + hashBytes > 0x4000) return stop(-6);
+    // Metadata: physically contiguous, written back to the point of coherency (Linux: dma_alloc_coherent, below 4 GiB). XNU's
+    // memory on pipa starts at 0xffc20000 and almost none of it lies below 4 GiB (2026-10-24: a below-4-GiB allocation failed,
+    // after a search that may have held the boot back), so any address below 2^40: the SMC64 call carries it in full, and
+    // TrustZone answers init_image with an error if it refuses it.
+    z[0] = 2;
+    const size_t metaBytes = size_t((ehdr + hashBytes + 0xfff) & ~0xfffull);
+    gZapMeta = IOBufferMemoryDescriptor::inTaskWithPhysicalMask(
+        kernel_task, static_cast<IOOptionBits>(kIODirectionInOut) | static_cast<IOOptionBits>(kIOMemoryPhysicallyContiguous),
+        metaBytes, 0xFFFFFFF000ULL);
+    if (!gZapMeta || gZapMeta->prepare() != kIOReturnSuccess) return stop(-7);
+    uint8_t *meta = static_cast<uint8_t *>(gZapMeta->getBytesNoCopy());
+    const uint64_t metaPhys = gZapMeta->getPhysicalSegment(0, nullptr);
+    z[15] = int32_t(metaPhys >> 12);   // the metadata's page number, for the row
+    if (!meta || !metaPhys) return stop(-8);
+    for (uint64_t i = 0; i < ehdr; ++i) meta[i] = fw[i];
+    for (uint64_t i = 0; i < hashBytes; ++i) meta[ehdr + i] = fw[hashOff + i];
+    cleanToPoc(meta, metaBytes);
+    // qcom_scm_pas_init_image: ARGS(2, VAL, RW).
+    z[0] = 3; native_gpu_step = 131;
+    uint64_t start = mach_absolute_time();
+    ScmRes r = scmCall(kScmPil(0x01), 2 | (2u << 6), kGpuPasId, metaPhys, 0);
+    z[1] = int32_t(r.a0); z[2] = int32_t(r.a1); z[8] = int32_t(msSince(start)); z[7] = int32_t(gScmResumes);
+    if (r.a0 || r.a1) return stop(3);
+    if (relocate) {
+        // qcom_scm_pas_mem_setup: ARGS(3).
+        z[0] = 4; native_gpu_step = 132;
+        start = mach_absolute_time();
+        r = scmCall(kScmPil(0x02), 3, kGpuPasId, kZapPhys, hi - lo);
+        z[3] = int32_t(r.a0); z[4] = int32_t(r.a1); z[9] = int32_t(msSince(start));
+        if (r.a0 || r.a1) return stop(4);
+    }
+    // qcom_mdt_load_no_init into the reserved region (relocatable: offsets from the lowest segment address).
+    z[0] = 5; native_gpu_step = 133;
+    {
+        IODeviceMemory *m = IODeviceMemory::withRange(kZapPhys, kZapBytes);
+        OSSharedPtr<IOMemoryMap> map;
+        if (m) {map = OSSharedPtr<IOMemoryMap>(m->map(kIOMapAnywhere | kIOMapWriteCombineCache), OSNoRetain); m->release();}
+        if (!map) return stop(-9);
+        volatile uint8_t *region = reinterpret_cast<volatile uint8_t *>(map->getVirtualAddress());
+        const uint64_t base = relocate ? lo : kZapPhys;
+        for (unsigned i = 0; i < phnum; ++i) {
+            if (ph(i, 0) != 1 || ((ph(i, 6) >> 24) & 7) == 2 || !ph(i, 5)) continue;
+            const uint64_t at = uint64_t(ph(i, 3)) - base, file = ph(i, 4), mem = ph(i, 5), off = ph(i, 1);
+            if (ph(i, 3) < base || at + mem > kZapBytes || file > mem || off + file > size) return stop(-10);
+            for (uint64_t b = 0; b < file; ++b) region[at + b] = fw[off + b];
+            for (uint64_t b = file; b < mem; ++b) region[at + b] = 0;
+        }
+        __asm__ volatile("dsb sy" ::: "memory");
+    }   // the CPU view is gone before TrustZone takes the region
+    // qcom_scm_pas_auth_and_reset: ARGS(1).
+    z[0] = 6; native_gpu_step = 134;
+    start = mach_absolute_time();
+    r = scmCall(kScmPil(0x05), 1, kGpuPasId, 0, 0);
+    z[5] = int32_t(r.a0); z[6] = int32_t(r.a1); z[10] = int32_t(msSince(start));
+    if (r.a0 || r.a1) return stop(6);
+    z[0] = 7;   // TrustZone authenticated the zap shader
+    return true;
+}
+// The zap shader, then CP_SET_SECURE_MODE(0) through the ring (hw_init after a6xx_zap_shader_init).
+bool leaveSecure() {
+    if (!zapLoad()) return false;
+    native_gpu_step = 135;
+    uint32_t words[2] = {}, fence = 0, seen = 0;
+    if (AdrenoPM4Type7(0x66, 1, &words[0]) != AdrenoPM4Success || gRing->submit(words, 2, &fence)) {zapRow("submit"); return false;}
+    native_gpu_zap[14] = int32_t(gRing->wait(fence, &gClock, 200000, &seen));
+    zapRow(native_gpu_zap[14] ? "secure exit timeout" : "ok");
+    return native_gpu_zap[14] == 0;
+}
+
+// The GPU interrupt (DT kgsl_3d0_irq: SPI 300, level high = INTID 332). As a6xx_irq: read RBBM_INT_0_STATUS and clear it through
+// RBBM_INT_CLEAR_CMD before anything else, so the level line drops before the EOI; the same status 100000 times in a row masks
+// the GPU interrupts.
+volatile uint32_t gIrqCount, gIrqSeen, gIrqLast, gIrqRepeat, gIrqMasked;
+void gpuIrq(void *) {
+    const uint32_t status = gpuRead(0x201);
+    if (status) gw(0x37, status);
+    gIrqRepeat = (status == gIrqLast && !(status & (1u << 20))) ? gIrqRepeat + 1 : 0;
+    gIrqLast = status;
+    gIrqSeen = gIrqSeen | status;
+    gIrqCount = gIrqCount + 1;
+    if (gIrqRepeat > 100000) {gw(0x38, 0); gIrqMasked = 1;}
+}
+// The secure-mode fence left CP_CACHE_FLUSH_TS set, so a working line fires as soon as it is enabled; a CP_NOP fence must fire it
+// again.
+void gpuInterrupt() {
+    native_gpu_step = 140;
+    uint32_t readback = 0;
+    uint64_t router = ~0ull;
+    const IOReturn attached = armcpu_spi_attach(32 + 300, false, gpuIrq, nullptr, &readback, &router);
+    IOSleep(20);
+    const uint32_t first = gIrqCount;
+    uint32_t nop = 0, fence = 0, seen = 0;
+    const bool fenced = AdrenoPM4Type7(0x10, 0, &nop) == AdrenoPM4Success && !gRing->submit(&nop, 1, &fence) &&
+                        !gRing->wait(fence, &gClock, 200000, &seen);
+    IOSleep(20);
+    snprintf(native_gpu_rows[kRowIrq], sizeof native_gpu_rows[0],
+             "IRQ attach %x readback %x router %llx count %u>%u nop fence %u seen %08x status now %08x masked %u",
+             static_cast<unsigned>(attached), readback, static_cast<unsigned long long>(router), first, gIrqCount, fenced, gIrqSeen,
+             gpuRead(0x201), gIrqMasked);
+    changed();
+}
+
 void gpuThread(void *, wait_result_t) {
     IOSleep(5000);
     native_gpu_step = 1;
@@ -575,7 +775,8 @@ void gpuThread(void *, wait_result_t) {
     gmuState(io, r, cx_gmu, ahb);
     if (gMode >= 7) gmuColdStart(r, native_gpu_clocks);
     if (gMode >= 8 && gColdOk) gxOn();
-    if (gMode >= 9 && native_gpu_gx.gx_on && gpuContext()) cpStart();
+    const bool cp = gMode >= 9 && native_gpu_gx.gx_on && gpuContext() && cpStart();
+    if (gMode >= 10 && cp && leaveSecure()) gpuInterrupt();
     native_gpu_step = 99;
 }
 }  // namespace
@@ -583,7 +784,7 @@ void gpuThread(void *, wait_result_t) {
 extern "C" void native_gpu_probe(void) {
     unsigned mode = 0;
     if (gMode || !PE_parse_boot_argn("pipa-gpu", &mode, sizeof mode) || !mode) return;
-    gMode = mode > 9 ? 9 : mode;
+    gMode = mode > 10 ? 10 : mode;
     thread_t thread = nullptr;
     if (kernel_thread_start(gpuThread, nullptr, &thread) == KERN_SUCCESS) thread_deallocate(thread);
 }
