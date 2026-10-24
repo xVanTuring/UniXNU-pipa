@@ -247,8 +247,9 @@ kernel_args = [
   "pipa-gpu=12",
   # Turnip's options (GpuProbe.cpp metal()): GMEM or system memory per pass, Turnip's own choice ("nocb" is a no-op on the A650).
   # Before APRIV the GMEM passes hung on CP_DRAW_INDX_OFFSET (UCHE_OOB_ACCESS); with it 40 scripted page turns over the home screen
-  # run at 54 frames a second while the UI moves (2026-10-24, E/P clusters). With "sysmem,nocb" the render server stopped committing
-  # after the unlock swipe in one round (7 command buffers, no crash, no GPU work outstanding).
+  # run at 54 frames a second while the UI moves (2026-10-24, E/P clusters), against 38 with "sysmem,nocb" (every pass in system
+  # memory). In one earlier "sysmem,nocb" round the render server stopped committing after the unlock swipe (7 command buffers, no
+  # crash, no GPU work outstanding); the next such round did not.
   "pipa-turnip-debug=nocb",
   # The GPU at its top level, 670 MHz (GX_BW_PERF_VOTE level 7): the plugin's scanout copy of a frame took 5 ms against 12 ms at
   # 305 MHz (2026-10-24).
