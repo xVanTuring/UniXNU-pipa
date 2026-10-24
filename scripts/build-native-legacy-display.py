@@ -302,6 +302,15 @@ gmu_c=touch_dir/'GmuFirmware.c'
 gmu_c.write_text(f'// {gmu_firmware.name}, sha256 {hashlib.sha256(gmu_blob).hexdigest()}\n#include <stdint.h>\n'
                  'const uint8_t native_gpu_gmu_firmware[] __attribute__((aligned(16))) = {'+','.join(map(str,gmu_blob))+'};\n'
                  f'const uint32_t native_gpu_gmu_firmware_size = {len(gmu_blob)};\n')
+# The CP's SQE microcode, a650_sqe.fw of the same vendor directory (PIPA_SQE_FIRMWARE overrides it).
+sqe_firmware=Path(os.environ.get('PIPA_SQE_FIRMWARE') or ROOT/'.cache/firmware/gpu/a650_sqe.fw')
+require(sqe_firmware.is_file(),f'Missing the SQE firmware {sqe_firmware} (the vendor partition\'s /firmware/a650_sqe.fw)')
+sqe_blob=sqe_firmware.read_bytes()
+require(len(sqe_blob)>=8 and len(sqe_blob)%4==0,f'{sqe_firmware} is not an SQE image')
+sqe_c=touch_dir/'SqeFirmware.c'
+sqe_c.write_text(f'// {sqe_firmware.name}, sha256 {hashlib.sha256(sqe_blob).hexdigest()}\n#include <stdint.h>\n'
+                 'const uint8_t native_gpu_sqe_firmware[] __attribute__((aligned(16))) = {'+','.join(map(str,sqe_blob))+'};\n'
+                 f'const uint32_t native_gpu_sqe_firmware_size = {len(sqe_blob)};\n')
 firmware=Path(os.environ.get('PIPA_TOUCH_FIRMWARE') or ROOT/'.cache/firmware/touch/novatek_nt36532_m82_fw_tm.bin')
 require(firmware.is_file(),f'Missing the touch firmware {firmware} (from the stock kernel\'s built-in firmware table)')
 blob=firmware.read_bytes()
@@ -326,7 +335,7 @@ def c_compile(c_source,c_obj):
 touch_objs=[probe_obj,gpu_obj]
 # Buttons.c (pipa-buttons=1, the power and volume keys over SPMI for the HID input) goes the same way.
 for c_source in (ROOT/'drivers/NativeGeniSpi/GeniSpi.c',ROOT/'drivers/NativeNovatekTouch/NvtProtocol.c',firmware_c,ROOT/'kits/pipa/Buttons.c',
-                 gmu_c):
+                 gmu_c,sqe_c):
     c_obj=touch_dir/(c_source.stem+'.o');c_compile(c_source,c_obj);touch_objs.append(c_obj)
 # The display backend, its probe, the key store, the HID input and the touch controller: UniXNU-tb128fu's Himax touch, GPU, RPM and
 # USB log probes, sheng's touch panel (THP), CPU frequency and GPU power objects and QEMU's VirtIO input, shared window and Metal
@@ -354,7 +363,7 @@ sources=[ROOT/'drivers/NativeMobileDisplay/NativeLegacyDisplay.cpp',ROOT/'driver
          ROOT/'kits/pipa/TouchBoard.h',ROOT/'kits/pipa/SmmuBypass.h',ROOT/'drivers/NativeGeniSpi/GeniSpi.c',
          ROOT/'drivers/NativeGeniSpi/GeniSpi.h',ROOT/'drivers/NativeNovatekTouch/NvtProtocol.c',
          ROOT/'drivers/NativeNovatekTouch/NvtProtocol.h',firmware,ROOT/'kits/pipa/Buttons.c',ROOT/'kits/pipa/ButtonsCore.h',
-         gpu_source,ROOT/'kits/pipa/GpuPowerBoard.h',ROOT/'kits/pipa/A650Gmu.h',gmu_firmware]
+         gpu_source,ROOT/'kits/pipa/GpuPowerBoard.h',ROOT/'kits/pipa/A650Gmu.h',gmu_firmware,sqe_firmware]
 print(run(['python3',ROOT/'scripts/build-arm-driver.py','NativeGOPPresenter'],text=True),end='')
 gop=ROOT/'build/native-gop-presenter';gop_late=gop/'NativeGOPPresenter.late.o'
 run([llvm/'llvm-objcopy','--remove-section=__DATA,__mod_init_func','--globalize-symbol=__GLOBAL__sub_I_NativeGOPPresenter.cpp',

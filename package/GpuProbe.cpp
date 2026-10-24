@@ -17,8 +17,13 @@
 //   8  as 7, then, only after a complete cold start: GX power through the GMU (A650GmuPowerGx: the GX_BW_PERF_VOTE for the GPU
 //      level `pipa-gpu-perf=<1..7>`, default 1 = 305 MHz, where Linux starts at the top one; then the OOB GPU_SET request), and
 //      with GX on the GX GDSC, RBBM_STATUS and both GBIF halt registers, read only.
+//   9  as 8, then, with GX on, the first GPU command, after UniXNU-tb128fu's GPU probe mode 7 (naContext, naHwInit, naCp): the
+//      GPU's own SMMU context through NativeAdreno (bank 0 / ASID 2, the GPU's streams 0, 1, 0x400 and 0x401 of its DT iommus
+//      <0 0x401> on SMR 0, 1, 4 and 5; non-coherent table walks), Linux v6.6 hw_init for the A650 (no clock gating, no APRIV),
+//      the SQE (a650_sqe.fw without its first dword), ring 0 with CP_RB_CNTL NO_UPDATE, CP_ME_INIT, then one CP_MEM_WRITE of
+//      a marker into the scratch page that the CPU reads back. The zap shader and the exit from secure mode are not done yet.
 // The rows below go to the kernel log whenever they change (BootRamoops.c). The sequence starts 5 s after the late probe, so the
-// display and the log thread already run if a read hangs the bus. Modes 1-7 ran on the tablet on 2026-10-24; mode 8 has not.
+// display and the log thread already run if a read hangs the bus. Modes 1-8 ran on the tablet on 2026-10-24; mode 9 has not.
 #include <IOKit/IOService.h>
 #include <IOKit/IOLib.h>
 #include <IOKit/IOMemoryDescriptor.h>
@@ -32,14 +37,22 @@ extern "C" {
 #include "A650Gmu.h"
 extern const uint8_t native_gpu_gmu_firmware[] __attribute__((weak_import));
 extern const uint32_t native_gpu_gmu_firmware_size __attribute__((weak_import));
+extern const uint8_t native_gpu_sqe_firmware[] __attribute__((weak_import));
+extern const uint32_t native_gpu_sqe_firmware_size __attribute__((weak_import));
+#include "AdrenoPM4.h"
 }
 #include "NativeAdrenoGmuContext.h"
+#include "NativeAdrenoGpuContext.h"
+#include "NativeAdrenoRing.h"
+#include "NativeAdrenoCpInit.h"
+#include "NativeAdrenoIrq.h"
 
 // Rows (at most 119 characters each, as the log copies them): 0 summary, 1 GCC, 2 GPUCC, 3 SMMU, 4-5 GMU clocks, 6-7 GMU state,
 // 8 command DB ARC entries, 9 its BCM entries, 10-12 the gfx, mx and cx level lists, 13 the GMU's SMMU context, 14 the cold
-// start's load, 15 its HFI messages, 16 the GMU state after it, 17 GX power.
+// start's load, 15 its HFI messages, 16 the GMU state after it, 17 GX power, 18 the GPU's SMMU context, 19 the CP steps, 20 the
+// CP's state after them.
 enum {kRowSummary, kRowGcc, kRowGpucc, kRowSmmu, kRowClk, kRowClk2, kRowGmu, kRowGmu2, kRowDbArc, kRowDbBcm, kRowLevels,
-      kRowContext = kRowLevels + 3, kRowLoad, kRowHfi, kRowAfter, kRowGx, kRows};
+      kRowContext = kRowLevels + 3, kRowLoad, kRowHfi, kRowAfter, kRowGx, kRowGpuCtx, kRowCp, kRowCpState, kRows};
 extern "C" {
 char native_gpu_rows[kRows][120];
 volatile uint32_t native_gpu_changes;
@@ -318,6 +331,222 @@ void gxOn() {
     changed();
 }
 
+// Mode 9. GPU register access for NativeAdreno (dword indices) through the GPU window.
+extern "C" {
+extern volatile uint32_t native_adreno_smmu_coherent_walk, native_adreno_wc_enabled, native_adreno_written_imports_owned,
+    native_adreno_pool_mib;
+NativeAdrenoGmuContextReport native_gpu_context;
+uint32_t native_gpu_cp[24];
+}
+constexpr unsigned kGpuBank = 0, kGpuAsid = 2, kGpuSlots[4] = {0, 1, 4, 5}, kGpuSids[4] = {0, 1, 0x400, 0x401};
+NativeAdrenoGpuBuffer gNb[5];
+OSSharedPtr<IOMemoryMap> gNbMaps[5];
+volatile uint8_t *gNbCpu[5];
+NativeAdrenoRing *gRing;
+NativeAdrenoCpInit *gCpInit;
+int naWrite(void *, uint32_t reg, uint32_t value) {
+    if (reg >= GPB_GPU_WINDOW / 4 || !gVa[GPB_WIN_GPU]) return 1;
+    *reinterpret_cast<volatile uint32_t *>(gVa[GPB_WIN_GPU] + reg * 4) = value;
+    __asm__ volatile("dsb sy" ::: "memory");
+    return 0;
+}
+int naRead(void *, uint32_t reg, uint32_t *value) {
+    if (reg >= GPB_GPU_WINDOW / 4 || !gVa[GPB_WIN_GPU]) return 1;
+    *value = *reinterpret_cast<volatile uint32_t *>(gVa[GPB_WIN_GPU] + reg * 4);
+    return 0;
+}
+int naBarrier(void *) {__asm__ volatile("dsb sy" ::: "memory"); return 0;}
+// The kernel buffers are Normal non-cacheable for the GPU and write-combined for the CPU: ordering only, no cache maintenance.
+int naPublish(void *, const volatile uint32_t *, size_t) {__asm__ volatile("dsb sy" ::: "memory"); return 0;}
+int naAcquire(void *, volatile uint32_t *, size_t) {__asm__ volatile("dsb sy" ::: "memory"); return 0;}
+uint64_t naNow(void *) {uint64_t us = 0; gmuNow(nullptr, &us); return us;}
+int naIdle(void *) {IODelay(20); return 0;}
+void naProgress(uint32_t step) {native_gpu_step = 110 + step;}
+NativeAdrenoRingIo gRio{nullptr, naWrite, naRead, naBarrier};
+NativeAdrenoRingCache gCache{nullptr, naPublish, naAcquire};
+NativeAdrenoRingClock gClock{nullptr, naNow, naIdle};
+void gw(uint32_t dword, uint32_t value) {naWrite(nullptr, dword, value);}
+void gw64(uint32_t dword, uint64_t value) {gw(dword, uint32_t(value)); gw(dword + 1, uint32_t(value >> 32));}
+uint32_t smmuRead(uint32_t at) {return *reinterpret_cast<volatile uint32_t *>(gSmmuMap->getVirtualAddress() + at);}
+void smmuWrite(uint32_t at, uint32_t v) {
+    *reinterpret_cast<volatile uint32_t *>(gSmmuMap->getVirtualAddress() + at) = v;
+    __asm__ volatile("dsb sy" ::: "memory");
+}
+uint32_t smmuBank0() {
+    // IDR1: PAGESIZE (bit 31) and NUMPAGENDXB (bits 30:28): the context banks start after 2^(NUMPAGENDXB + 1) pages (0x8000 here).
+    const uint32_t id1 = smmuRead(0x24);
+    return ((id1 >> 31) ? 0x10000u : 0x1000u) << (((id1 >> 28) & 7) + 1);
+}
+
+// The GPU's context: bank 0 (arm-smmu-qcom gives the GPU bank 0), the four streams of iommus <0 0x401> (stream 0 under the mask
+// 0x401) on the SMR slots the GMU does not use, a 2 GiB aperture of 4 KiB pages and NativeAdreno's five kernel buffers. The table
+// walks are non-coherent (cleaned tables) as on UniXNU-tb128fu, which works whether or not the walker snoops.
+bool gpuContext() {
+    char *row = native_gpu_rows[kRowGpuCtx];
+    const size_t cap = sizeof native_gpu_rows[0];
+    native_gpu_step = 110;
+    native_adreno_smmu_coherent_walk = 0;
+    native_adreno_wc_enabled = 1;
+    native_adreno_written_imports_owned = 1;
+    unsigned pool = 384;   // MiB, the BO pool taken before memory fragments; pipa-gpu-pool=0 for scattered BOs only
+    PE_parse_boot_argn("pipa-gpu-pool", &pool, sizeof pool);
+    native_adreno_pool_mib = pool;
+    NativeAdrenoGmuContextReport &g = native_gpu_context;
+    const IOReturn ctx = NativeAdrenoGpuContextBringupRoutes(reinterpret_cast<volatile uint8_t *>(gSmmuMap->getVirtualAddress()),
+        kSmmuWindow, kGpuBank, kGpuAsid, kGpuSlots, kGpuSids, 4, naProgress, &g);
+    // CB0 ACTLR without CPRE (arm_mmu500_reset, MMU-500 errata 841119/826419), then TLBIALL, TLBSYNC and TLBSTATUS of the bank.
+    uint32_t actlr = 0;
+    if (!ctx) {
+        const uint32_t bank0 = smmuBank0();
+        actlr = smmuRead(bank0 + 0x4);
+        smmuWrite(bank0 + 0x4, actlr & ~2u);
+        smmuWrite(bank0 + 0x618, 0);
+        smmuWrite(bank0 + 0x7f0, 0);
+        for (unsigned i = 0; i < 1000 && (smmuRead(bank0 + 0x7f4) & 1); ++i) IODelay(1);
+    }
+    snprintf(row, cap, "GPUCTX step %u status %x kit %u/%u routes %u program %u/%u/%u ttbr0 %llx smr %08x s2cr %08x actlr %x pool %u",
+             g.step, static_cast<unsigned>(ctx), g.program_status, g.route_status, g.routes_verified, g.program_phase,
+             g.program_readback_valid, g.program_enabled, static_cast<unsigned long long>(g.ttbr0), g.smr, g.s2cr, actlr, pool);
+    changed();
+    return ctx == kIOReturnSuccess;
+}
+
+// CP register protection of the A650: Linux v6.6 a650_protect, encoded as A6XX_PROTECT_RDONLY (start | (count - 1) << 18) and
+// A6XX_PROTECT_NORDWR (that | 1 << 31); the last entry goes into CP_PROTECT(47) with an unbounded range.
+constexpr uint32_t rdonly(uint32_t reg, uint32_t len) {return ((len & 0x3FFF) << 18) | (reg & 0x3FFFF);}
+constexpr uint32_t nordwr(uint32_t reg, uint32_t len) {return (1u << 31) | rdonly(reg, len);}
+constexpr uint32_t kProtect[] = {
+    rdonly(0x00000, 0x04ff), rdonly(0x00501, 0x0005), rdonly(0x0050b, 0x02f4), nordwr(0x0050e, 0x0000), nordwr(0x00510, 0x0000),
+    nordwr(0x00534, 0x0000), nordwr(0x00800, 0x0082), nordwr(0x008a0, 0x0008), nordwr(0x008ab, 0x0024), rdonly(0x008de, 0x00ae),
+    nordwr(0x00900, 0x004d), nordwr(0x0098d, 0x0272), nordwr(0x00e00, 0x0001), nordwr(0x00e03, 0x000c), nordwr(0x03c00, 0x00c3),
+    rdonly(0x03cc4, 0x1fff), nordwr(0x08630, 0x01cf), nordwr(0x08e00, 0x0000), nordwr(0x08e08, 0x0000), nordwr(0x08e50, 0x001f),
+    nordwr(0x08e80, 0x027f), nordwr(0x09624, 0x01db), nordwr(0x09e60, 0x0011), nordwr(0x09e78, 0x0187), nordwr(0x0a630, 0x01cf),
+    nordwr(0x0ae02, 0x0000), nordwr(0x0ae50, 0x032f), nordwr(0x0b604, 0x0000), nordwr(0x0b608, 0x0007), nordwr(0x0be02, 0x0001),
+    nordwr(0x0be20, 0x17df), nordwr(0x0f000, 0x0bff), rdonly(0x0fc00, 0x1fff), nordwr(0x18400, 0x1fff), nordwr(0x1a800, 0x1fff),
+    nordwr(0x1f400, 0x0443), rdonly(0x1f844, 0x007b), nordwr(0x1f887, 0x001b), nordwr(0x1f8c0, 0x0000),
+};
+constexpr unsigned kProtectCount = sizeof kProtect / sizeof kProtect[0];
+static_assert(kProtectCount == 39, "a650_protect has 39 entries");
+
+// hw_init of Linux v6.6 a6xx_gpu.c for the A650 (a650 family, with a GMU); register offsets from a6xx.xml / a6xx_gmu.xml.
+// Hardware clock gating is left off (the clocks run), APRIV is not enabled (the ring uses NO_UPDATE as on the A610).
+void hwInit() {
+    gw(0x3C45, 0); (void)gpuRead(0x3C45);                               // GBIF_HALT
+    gw(0x0016, 0); (void)gpuRead(0x0016);                               // RBBM_GBIF_HALT
+    gw(0xF803, 0);                                                      // RBBM_SECVID_TSB_CNTL
+    gw64(0xF800, 0); gw(0xF802, 0);                                     // TSB_TRUSTED_BASE, _SIZE: no trusted range
+    static const uint32_t addrMode[] = {0x842, 0xC01, 0x8601, 0x8E05, 0x9E01, 0xBE05, 0xA601, 0x9601, 0xE00, 0xAE01, 0xB601, 0xF810};
+    for (uint32_t reg : addrMode) gw(reg, 1);                           // *_ADDR_MODE_CNTL: 64-bit
+    for (uint32_t reg = 0x3C03; reg <= 0x3C06; ++reg) gw(reg, 0x00071620);   // GBIF_QSB_SIDE0..3 (a650 family)
+    gw(0x0011, 0x3);                                                    // RBBM_GBIF_CLIENT_QOS_CNTL
+    gw(0x050B, 0xffffffff);                                             // RBBM_PERFCTR_GPU_BUSY_MASKED
+    gw64(0xE05, 0x0001ffffffffffc0ull);                                 // UCHE_WRITE_RANGE_MAX
+    gw64(0xE09, 0x0001fffffffff000ull);                                 // UCHE_TRAP_BASE
+    gw64(0xE07, 0x0001fffffffff000ull);                                 // UCHE_WRITE_THRU_BASE (no GMEM range on the a650 family)
+    gw(0xE18, 0x804); gw(0xE17, 0x4);                                   // UCHE_FILTER_CNTL, UCHE_CACHE_WAYS
+    gw(0x8C2, 0x02000140); gw(0x8C1, 0x8040362c);                       // CP_ROQ_THRESHOLDS_2/_1 (a640/a650 family)
+    gw(0x8C3, 128);                                                     // CP_MEM_POOL_SIZE
+    gw(0x9E00, 0x00300200);                                             // PC_DBG_ECO_CNTL (A650)
+    gw(0x98D, 1);                                                       // CP_AHB_CNTL: error response
+    gw(0x500, 1);                                                       // RBBM_PERFCTR_CNTL
+    gw(0x8D0, 0);                                                       // CP_PERFCTR_CP_SEL(0): PERF_CP_ALWAYS_COUNT
+    // a6xx_set_ubwc_config for the A650: hbb_lo 3 (highest bank bit 16, DTS qcom,highest-bank-bit), amsbc 1, rgb565 predicator 1,
+    // uavflagprd_inv 2, min_acc_len 0, ubwc_mode 0.
+    gw(0x8E08, 0x816); gw(0xB604, 0x6); gw(0xAE02, 0x26);               // RB, TPL1, SP _NC_MODE_CNTL
+    gw(0xE01, 3u << 21);                                                // UCHE_MODE_CNTL
+    gw(0x001F, (1u << 30) | 0x1fffff);                                  // RBBM_INTERFACE_HANG_INT_CNTL
+    gw(0xE19, 1);                                                       // UCHE_CLIENT_PF
+    gw(0xB608, 0); gw(0xB609, 0x3fe05ff4); gw(0xB60A, 0x3fa0ebee);       // TPL1_BICUBIC_WEIGHTS_TABLE_0..4 (a650 family)
+    gw(0xB60B, 0x3f5193ed); gw(0xB60C, 0x3f0243f0);
+    // The CX GMU counter 0 counts busy ticks; the power counter on (GMU registers).
+    gmuWrite(nullptr, A650GmuCore, 0x930e * 4, 0xff000000);              // GPU_GMU_AO_GPU_CX_BUSY_MASK
+    uint32_t sel = 0;
+    gmuRead(nullptr, A650GmuCore, 0x5041 * 4, &sel);
+    gmuWrite(nullptr, A650GmuCore, 0x5041 * 4, (sel & ~0xffu) | (1u << 5));   // GMU_CX_GMU_POWER_COUNTER_SELECT_0
+    gmuWrite(nullptr, A650GmuCore, 0x5040 * 4, 1);                       // GMU_CX_GMU_POWER_COUNTER_ENABLE
+    // a6xx_set_cp_protect: enable, fault on violation, last span unbounded.
+    gw(0x84F, (1u << 0) | (1u << 1) | (1u << 3));                       // CP_PROTECT_CNTL
+    for (unsigned i = 0; i + 1 < kProtectCount; ++i) gw(0x850 + i, kProtect[i]);
+    gw(0x850 + 47, kProtect[kProtectCount - 1]);                        // CP_PROTECT(47)
+    gw(0x038, NativeAdrenoIrq::maskA6xx());                             // RBBM_INT_0_MASK: A6XX_INT_MASK
+}
+
+// SQE, hw_init, ring 0, CP_ME_INIT, then a CP_MEM_WRITE into the scratch page that the CPU reads back.
+bool cpStart() {
+    uint32_t *n = native_gpu_cp;
+    char *row = native_gpu_rows[kRowCp], *state = native_gpu_rows[kRowCpState];
+    const size_t cap = sizeof native_gpu_rows[0];
+    auto report = [&](const char *what) {
+        snprintf(row, cap, "CP %s step %u sqe %u/%u ring %x init %x fence %x/%u write %x marker %08x", what, n[0], n[1], n[2], n[3],
+                 n[4], n[5], n[6], n[7], n[8]);
+        // RBBM_STATUS, CP_RB_RPTR, CP_RB_WPTR, CP_HW_FAULT, CP_INTERRUPT_STATUS, RBBM_INT_0_STATUS, SMMU CB0 FSR and FAR
+        const uint32_t bank0 = smmuBank0();
+        snprintf(state, cap, "CPSTATE rbbm %08x rptr %x wptr %x hwfault %x cpint %x int0 %08x cb0 fsr %08x far %08x%08x",
+                 gpuRead(0x210), gpuRead(0x806), gpuRead(0x807), gpuRead(0x821), gpuRead(0x823), gpuRead(0x201),
+                 smmuRead(bank0 + 0x58), smmuRead(bank0 + 0x64), smmuRead(bank0 + 0x60));
+        changed();
+    };
+    native_gpu_step = 120;
+    n[0] = 1;
+    if (NativeAdrenoGpuContextBuffers(gNb)) {report("no buffers"); return false;}
+    for (unsigned i = 0; i < 5; ++i) {
+        IODeviceMemory *m = IODeviceMemory::withRange(gNb[i].physical, gNb[i].bytes);
+        if (m) {
+            gNbMaps[i] = OSSharedPtr<IOMemoryMap>(m->map(kIOMapAnywhere | kIOMapWriteCombineCache), OSNoRetain);
+            m->release();
+        }
+        if (!gNbMaps[i]) {report("nomap"); return false;}
+        gNbCpu[i] = reinterpret_cast<volatile uint8_t *>(gNbMaps[i]->getVirtualAddress());
+    }
+    // The SQE without its first dword (adreno_fw_create_bo), read back.
+    n[0] = 2;
+    if (!&native_gpu_sqe_firmware || !&native_gpu_sqe_firmware_size || native_gpu_sqe_firmware_size < 8 ||
+        native_gpu_sqe_firmware_size - 4 > gNb[0].bytes) {report("no sqe"); return false;}
+    const uint32_t sqeBytes = native_gpu_sqe_firmware_size - 4;
+    n[1] = sqeBytes;
+    for (uint32_t i = 0; i < sqeBytes; ++i) gNbCpu[0][i] = native_gpu_sqe_firmware[4 + i];
+    __asm__ volatile("dsb sy" ::: "memory");
+    for (uint32_t i = 0; i < sqeBytes && !n[2]; ++i) if (gNbCpu[0][i] != native_gpu_sqe_firmware[4 + i]) n[2] = i + 1;
+    if (n[2]) {report("sqe readback"); return false;}
+    n[0] = 3; native_gpu_step = 121;
+    hwInit();
+    gw64(0x830, gNb[0].iova);                                           // CP_SQE_INSTR_BASE, before CP_SQE_CNTL
+    // Ring 0: 32 KiB at its IOVA, the memptrs page for the fence; A6XX forms (NO_UPDATE, CACHE_FLUSH_TS fences).
+    n[0] = 4; native_gpu_step = 122;
+    gRing = new NativeAdrenoRing;
+    gCpInit = new NativeAdrenoCpInit;
+    if (!gRing || !gCpInit || gRing->setGeneration(6)) {report("no ring"); return false;}
+    n[3] = uint32_t(gRing->attach(&gRio, &gCache, const_cast<uint8_t *>(gNbCpu[1]), gNb[1].bytes, gNb[1].iova,
+                                  const_cast<uint8_t *>(gNbCpu[2]), gNb[2].bytes, gNb[2].iova));
+    if (n[3]) {report("ring attach"); return false;}
+    gw(0x808, 1);                                                       // CP_SQE_CNTL: start the microcode
+    // a6xx_cp_init: CP_ME_INIT with its eight words.
+    n[0] = 5; native_gpu_step = 123;
+    NativeAdrenoCpInitConfig config{gNb[0].iova, 0, 1};
+    config.generation = 6;
+    uint32_t fence = 0;
+    n[4] = uint32_t(gCpInit->run(&gRio, gRing, &config, &fence));
+    if (n[4]) {report("cp init"); return false;}
+    n[5] = uint32_t(gRing->wait(fence, &gClock, 200000, &n[6]));
+    if (n[5]) {report("cp init fence"); return false;}
+    // The first command through NativeAdreno's mapping: CP_MEM_WRITE (address lo/hi, data) into the scratch page.
+    n[0] = 6; native_gpu_step = 124;
+    volatile uint32_t *scratch = reinterpret_cast<volatile uint32_t *>(gNbCpu[4]);
+    scratch[0] = 0;
+    __asm__ volatile("dsb sy" ::: "memory");
+    uint32_t words[4] = {};
+    if (AdrenoPM4Type7(0x3d, 3, &words[0]) != AdrenoPM4Success) {report("pm4"); return false;}
+    words[1] = uint32_t(gNb[4].iova); words[2] = uint32_t(gNb[4].iova >> 32); words[3] = 0xA6500C0D;
+    if (gRing->submit(words, 4, &fence)) {report("submit"); return false;}
+    uint32_t seen = 0;
+    n[7] = uint32_t(gRing->wait(fence, &gClock, 200000, &seen));
+    n[8] = scratch[0];
+    if (n[7] || n[8] != 0xA6500C0D) {report("mem write"); return false;}
+    n[0] = 7;
+    report("ok");
+    return true;
+}
+
 void gpuThread(void *, wait_result_t) {
     IOSleep(5000);
     native_gpu_step = 1;
@@ -346,6 +575,7 @@ void gpuThread(void *, wait_result_t) {
     gmuState(io, r, cx_gmu, ahb);
     if (gMode >= 7) gmuColdStart(r, native_gpu_clocks);
     if (gMode >= 8 && gColdOk) gxOn();
+    if (gMode >= 9 && native_gpu_gx.gx_on && gpuContext()) cpStart();
     native_gpu_step = 99;
 }
 }  // namespace
@@ -353,7 +583,7 @@ void gpuThread(void *, wait_result_t) {
 extern "C" void native_gpu_probe(void) {
     unsigned mode = 0;
     if (gMode || !PE_parse_boot_argn("pipa-gpu", &mode, sizeof mode) || !mode) return;
-    gMode = mode > 8 ? 8 : mode;
+    gMode = mode > 9 ? 9 : mode;
     thread_t thread = nullptr;
     if (kernel_thread_start(gpuThread, nullptr, &thread) == KERN_SUCCESS) thread_deallocate(thread);
 }
