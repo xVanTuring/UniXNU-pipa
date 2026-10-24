@@ -246,9 +246,12 @@ kernel_args = [
 [payload.adt]
 tool = "scripts/make-pipa-adt.py"
 chip_id = "207"
-# 4 GiB, as the iPad7,1. DarwinBoot takes the first free run of the firmware's map that holds it; Android finds
-# 0xffc20000..0x27fffffff (6 GiB) free in the second bank, and the third bank has 8 GiB.
-owned_memory_size = "0x100000000"
+# XNU takes one contiguous range: DarwinBoot takes the first free run of the firmware's map that holds it. Android finds
+# 0xffc20000..0x27fffffff (6 GiB) free in the second bank, and the third bank (0x800000000, 8 GiB) has the firmware's own images
+# at its top (0x9ff...). 4 GiB (the iPad7,1's) landed at 0x10007c000 in the second bank. 7.75 GiB went to the third bank and the
+# kernel stopped after the blue entry bar (2026-10-24): a physical base at 32 GiB is not handled yet. 5.75 GiB still fits the
+# second bank. All 16 GB would need several ranges in XNU's pmap and VM start-up.
+owned_memory_size = "0x170000000"
 root_match_volume_uuid = "04769D26-2CA0-4825-B443-E2E5F88300F2"   # the OS volume of the same IPSW
 # All eight cores, boot CPU first: 0..0x300 Kryo 585 Silver (Cortex-A55), 0x400..0x600 Gold and 0x700 Gold Prime (Cortex-A77),
 # one scheduler cluster (no cluster-type, as on sheng). "0" keeps the boot CPU only (pipa's first boots, 2026-10-23).

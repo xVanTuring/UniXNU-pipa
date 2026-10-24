@@ -132,7 +132,7 @@ Read under Android 14 (HyperOS 2.0.20) with `android-devinfo` on 2026-10-21; the
 ## Next steps
 
 1. GPU: NativeAdreno's submission object and publication for user clients, the Metal accelerator, the GPU addon (Metal plugin, Turnip) and the GPU copy to the scanout, with UniXNU-sheng's choices for an Adreno that can (GMEM rendering with binning, the Apple GPU families reported, the top GPU level, bandwidth votes) rather than UniXNU-tb128fu's A610 compromises; then clock gating and APRIV.
-2. Memory: XNU owns one contiguous range (4 GiB of the second bank now); 7.75 GiB of the third bank next, and later all 16 GB, which needs several physical ranges in XNU's pmap and VM start-up.
+2. Memory: XNU owns one contiguous range, 5.75 GiB of the second bank since 2026-10-24 (from 0xffc20000; 4 GiB before). 7.75 GiB went to the third bank (0x800000000) and the kernel stopped after the blue entry bar, without a log: a physical base at 32 GiB is not handled yet. All 16 GB needs several physical ranges in XNU's pmap and VM start-up.
 3. Display: the CPU copy to the firmware frame buffer has no vertical sync (tearing, as on UniXNU-tb128fu); later the DSI/MDSS path or a GPU copy.
 4. A UFS log beside the ramoops zone, for resets that do not keep memory.
 
