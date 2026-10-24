@@ -73,6 +73,16 @@ typedef struct {
  * a6xx_gmu_resume. */
 A650GmuStatus A650GmuColdStart(A650GmuDevice *, const A650GmuConfig *, const AdrenoHfiStartupConfig *,
     const A650GmuStartupLimits *, A650GmuStartupResult *);
+/* After a complete cold start: GX power through the GMU, as Linux brings it up. a6xx_gmu_set_initial_freq ->
+ * a6xx_hfi_set_freq sends GX_BW_PERF_VOTE {ack_type 1 (blocking), perf_index, bandwidth 0}; hw_init's
+ * a6xx_gmu_set_oob(GMU_OOB_GPU_SET) sets HOST2GMU bit 30 and waits for GMU2HOST bit 31 (100 us apart, 10 ms), then clears it.
+ * GX is on when SPTPRAC_PWR_CLK_STATUS shows neither GX_HM_GDSC_POWER_OFF (bit 6) nor GX_HM_CLK_OFF (bit 7)
+ * (a6xx_gmu_gx_is_on). perf_index 1..7 picks the GPU level of A650GmuBuildStartup's table (305 to 670 MHz). */
+typedef struct {
+    uint32_t vote_status, vote_error, oob_polls, oob_info, gx_before, gx_after;
+    uint32_t gx_on;
+} A650GmuGxResult;
+A650GmuStatus A650GmuPowerGx(A650GmuDevice *, unsigned perf_index, A650GmuGxResult *);
 /* The HFI tables for pipa: the GPU levels of the DTS gpu-opp-table_v2 (305 to 670 MHz, RPMh levels 64 to 320) and the GMU's
  * 200 MHz at MIN_SVS (48), each with an off entry, voted from the command DB's gfx/mx and cx/mx level lists (16-bit words);
  * the bandwidth table is a650_build_bw_table's single "off" level, with the BCM addresses from the command DB instead of

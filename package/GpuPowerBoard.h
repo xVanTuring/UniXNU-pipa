@@ -23,7 +23,7 @@
 #define GPB_SMMU_BASE 0x03da0000ULL
 #define GPB_SMMU_GR0_SIZE 0x1000ULL       // global space 0 only
 #define GPB_GPU_BASE 0x03d00000ULL
-#define GPB_GPU_WINDOW 0x1000ULL          // one page is enough for RBBM_STATUS
+#define GPB_GPU_WINDOW 0x40000ULL         // the whole register space (DTS kgsl_3d0_reg_memory); stage 1 reads RBBM_STATUS only
 #define GPB_GMU_BASE 0x03d6a000ULL
 #define GPB_GMU_SIZE 0x30000ULL
 #define GPB_RSCC_BASE 0x03de0000ULL

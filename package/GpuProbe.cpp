@@ -14,8 +14,11 @@
 //      reset: the GMU's own SMMU context through NativeAdreno (bank 1, ASID 1; the GMU kernel stream 5 under its DT mask 0x400 as
 //      two exact routes, 5 on SMR 2 and 0x405 on SMR 3), a write-combined CPU view of its five regions, and the A650 cold start
 //      (package/A650Gmu.c) with the embedded a650_gmu.bin and the HFI tables built from the command DB. GX stays off.
+//   8  as 7, then, only after a complete cold start: GX power through the GMU (A650GmuPowerGx: the GX_BW_PERF_VOTE for the GPU
+//      level `pipa-gpu-perf=<1..7>`, default 1 = 305 MHz, where Linux starts at the top one; then the OOB GPU_SET request), and
+//      with GX on the GX GDSC, RBBM_STATUS and both GBIF halt registers, read only.
 // The rows below go to the kernel log whenever they change (BootRamoops.c). The sequence starts 5 s after the late probe, so the
-// display and the log thread already run if a read hangs the bus. Modes 1-6 ran on the tablet on 2026-10-24; mode 7 has not.
+// display and the log thread already run if a read hangs the bus. Modes 1-7 ran on the tablet on 2026-10-24; mode 8 has not.
 #include <IOKit/IOService.h>
 #include <IOKit/IOLib.h>
 #include <IOKit/IOMemoryDescriptor.h>
@@ -34,9 +37,9 @@ extern const uint32_t native_gpu_gmu_firmware_size __attribute__((weak_import));
 
 // Rows (at most 119 characters each, as the log copies them): 0 summary, 1 GCC, 2 GPUCC, 3 SMMU, 4-5 GMU clocks, 6-7 GMU state,
 // 8 command DB ARC entries, 9 its BCM entries, 10-12 the gfx, mx and cx level lists, 13 the GMU's SMMU context, 14 the cold
-// start's load, 15 its HFI messages, 16 the GMU state after it.
+// start's load, 15 its HFI messages, 16 the GMU state after it, 17 GX power.
 enum {kRowSummary, kRowGcc, kRowGpucc, kRowSmmu, kRowClk, kRowClk2, kRowGmu, kRowGmu2, kRowDbArc, kRowDbBcm, kRowLevels,
-      kRowContext = kRowLevels + 3, kRowLoad, kRowHfi, kRowAfter, kRows};
+      kRowContext = kRowLevels + 3, kRowLoad, kRowHfi, kRowAfter, kRowGx, kRows};
 extern "C" {
 char native_gpu_rows[kRows][120];
 volatile uint32_t native_gpu_changes;
@@ -170,6 +173,7 @@ A650GmuDevice gDevice;
 A650GmuConfig gConfig;
 AdrenoHfiStartupConfig gStartup;
 A650GmuStartupResult gCold;
+bool gColdOk;
 extern "C" {
 NativeAdrenoGmuContextReport native_gpu_gmu_context;
 }
@@ -277,6 +281,41 @@ void gmuColdStart(const gpb_result &r, const gpb_gmu_clock_on &o) {
     snprintf(native_gpu_rows[kRowAfter], cap, "AFTER sysreset %08x init %08x hfi %08x gx %08x ao %08x", after[0], after[1], after[2],
              after[3], after[4]);
     changed();
+    gColdOk = cold == A650GmuSuccess;
+}
+
+// Mode 8. GPU register reads through the GPU window (a6xx.xml dword offsets).
+extern "C" {
+A650GmuGxResult native_gpu_gx;
+}
+constexpr uint32_t kRbbmGbifHalt = 0x0016, kRbbmGbifHaltAck = 0x0017, kRbbmStatus = 0x0210, kGbifHalt = 0x3c45,
+                   kGbifHaltAck = 0x3c46;
+uint32_t gpuRead(uint32_t dword) {
+    uint32_t v = 0xdeadbeef;
+    rd(nullptr, GPB_WIN_GPU, dword * 4, &v);
+    return v;
+}
+void gxOn() {
+    unsigned perf = 1;
+    PE_parse_boot_argn("pipa-gpu-perf", &perf, sizeof perf);
+    if (perf < 1 || perf > 7) perf = 1;
+    native_gpu_step = 100;
+    A650GmuGxResult &g = native_gpu_gx;
+    const A650GmuStatus status = A650GmuPowerGx(&gDevice, perf, &g);
+    uint32_t gdscr = 0;
+    rd(nullptr, GPB_WIN_GPUCC, GPB_CC_GX_GDSCR, &gdscr);
+    char *row = native_gpu_rows[kRowGx];
+    const size_t cap = sizeof native_gpu_rows[0];
+    if (!g.gx_on) {
+        snprintf(row, cap, "GX status %u perf %u vote %u/%x oob %u info %08x gx %08x>%08x gdscr %08x off", status, perf,
+                 g.vote_status, g.vote_error, g.oob_polls, g.oob_info, g.gx_before, g.gx_after, gdscr);
+    } else {
+        native_gpu_step = 101;
+        snprintf(row, cap, "GX on perf %u vote %u oob %u gx %08x>%08x gdscr %08x rbbm %08x gbif halt %x/%x rbbm halt %x/%x", perf,
+                 g.vote_status, g.oob_polls, g.gx_before, g.gx_after, gdscr, gpuRead(kRbbmStatus), gpuRead(kGbifHalt),
+                 gpuRead(kGbifHaltAck), gpuRead(kRbbmGbifHalt), gpuRead(kRbbmGbifHaltAck));
+    }
+    changed();
 }
 
 void gpuThread(void *, wait_result_t) {
@@ -306,6 +345,7 @@ void gpuThread(void *, wait_result_t) {
     }
     gmuState(io, r, cx_gmu, ahb);
     if (gMode >= 7) gmuColdStart(r, native_gpu_clocks);
+    if (gMode >= 8 && gColdOk) gxOn();
     native_gpu_step = 99;
 }
 }  // namespace
@@ -313,7 +353,7 @@ void gpuThread(void *, wait_result_t) {
 extern "C" void native_gpu_probe(void) {
     unsigned mode = 0;
     if (gMode || !PE_parse_boot_argn("pipa-gpu", &mode, sizeof mode) || !mode) return;
-    gMode = mode > 7 ? 7 : mode;
+    gMode = mode > 8 ? 8 : mode;
     thread_t thread = nullptr;
     if (kernel_thread_start(gpuThread, nullptr, &thread) == KERN_SUCCESS) thread_deallocate(thread);
 }

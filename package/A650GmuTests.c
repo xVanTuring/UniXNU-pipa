@@ -14,7 +14,7 @@
 static const size_t bytes[A650GmuWindows] = {A650_GMU_CORE_BYTES, A650_GMU_RSCC_BYTES, A650_GMU_PDC_BYTES};
 static struct {
     uint32_t *regs[A650GmuWindows];
-    unsigned writes, hold_firmware, hold_hfi, hold_ack, fault_on_release, peer, commands, firmware_error_at;
+    unsigned writes, hold_firmware, hold_hfi, hold_ack, hold_gx, fault_on_release, peer, commands, firmware_error_at;
     uint64_t time;
 } f;
 static A650GmuDevice device;
@@ -29,8 +29,8 @@ static void respond(void)
     volatile uint32_t *s = config.hfi.cpu;
     unsigned at = s[16];
     uint32_t header = s[1024 + at];
-    static const unsigned ids[4] = {4, 3, 14, 10}, words[4] = {59, 160, 2, 1};
-    CHECK(f.commands < 4 && (header & 255) == ids[f.commands] && ((header >> 8) & 255) == words[f.commands]);
+    static const unsigned ids[5] = {4, 3, 14, 10, 30}, words[5] = {59, 160, 2, 1, 4};
+    CHECK(f.commands < 5 && (header & 255) == ids[f.commands] && ((header >> 8) & 255) == words[f.commands]);
     ++f.commands;
     s[16] = s[17];
     at = s[29];
@@ -56,7 +56,12 @@ static int write32(void *cookie, unsigned w, size_t at, uint32_t value)
         if (f.fault_on_release) *core(0x9305) = 1;             /* AO watchdog bite */
     }
     if (dword == 0x5186 && value && !f.hold_hfi) *core(0x5180) = 1;   /* HFI_CTRL_INIT -> HFI_CTRL_STATUS */
-    if (dword == 0x5194 && value == 1 && f.peer) respond();           /* HOST2GMU_INTR_SET */
+    if (dword == 0x5194 && value == 1 && f.peer) respond();           /* HOST2GMU_INTR_SET: a message */
+    if (dword == 0x5194 && value == (1u << 30) && !f.hold_gx) {       /* HOST2GMU_INTR_SET: OOB GPU_SET */
+        *core(0x5192) |= 1u << 31;                                    /* GMU2HOST_INTR_INFO: its acknowledgement */
+        *core(0x50d0) &= ~0xc0u;                                      /* GX powered */
+    }
+    if (dword == 0x5191) *core(0x5192) &= ~value;                     /* GMU2HOST_INTR_CLR */
     return 0;
 }
 static int barrier(void *cookie) {CHECK(cookie == &f); return 0;}
@@ -66,9 +71,10 @@ static void *allocate(size_t n) {void *p = NULL; CHECK(!posix_memalign(&p, 4096,
 static void reset(void)
 {
     for (unsigned i = 0; i < A650GmuWindows; ++i) memset(f.regs[i], 0, bytes[i]);
-    f.writes = f.hold_firmware = f.hold_hfi = f.hold_ack = f.fault_on_release = f.peer = f.commands = f.firmware_error_at = 0;
+    f.writes = f.hold_firmware = f.hold_hfi = f.hold_ack = f.hold_gx = f.fault_on_release = f.peer = f.commands = f.firmware_error_at = 0;
     f.time = 1000000;
     *core(0x5000) = 1;                                          /* held in reset */
+    *core(0x50d0) = 0xc0;                                       /* GX off, as read on the tablet */
     device = (A650GmuDevice){0};
     device.io = (A650GmuIo){&f, {A650_GMU_CORE_BYTES, A650_GMU_RSCC_BYTES, A650_GMU_PDC_BYTES}, read32, write32, barrier};
     device.services = (A650GmuServices){&f, now, wait_us};
@@ -156,6 +162,23 @@ int main(int argc, char **argv)
                r.load.firmware_init_result, f.writes);
         /* One attempt per device. */
         CHECK(A650GmuColdStart(&device, &config, &startup, &limits, &r) == A650GmuBusy);
+        /* GX: the perf vote (fifth message), then the GPU_SET request and its acknowledgement, cleared afterwards. */
+        A650GmuGxResult gx;
+        CHECK(A650GmuPowerGx(&device, 8, &gx) == A650GmuArgument);
+        CHECK(A650GmuPowerGx(&device, 1, &gx) == A650GmuSuccess && gx.gx_on && f.commands == 5);
+        CHECK(gx.vote_status == AdrenoHfiSuccess && gx.gx_before == 0xc0 && gx.gx_after == 0 && gx.oob_polls == 1);
+        CHECK(!(*core(0x5192) & (1u << 31)));
+        printf("gx: vote %u, ack after %u polls, status %08x > %08x\n", gx.vote_status, gx.oob_polls, gx.gx_before, gx.gx_after);
+    }
+    /* GX without a completed cold start is refused; a GPU_SET that is never acknowledged times out. */
+    {
+        reset();
+        A650GmuGxResult gx;
+        CHECK(A650GmuPowerGx(&device, 1, &gx) == A650GmuStateMismatch && f.writes == 0);
+        reset(); f.peer = 1; f.hold_gx = 1;
+        A650GmuStartupResult r;
+        CHECK(A650GmuColdStart(&device, &config, &startup, &limits, &r) == A650GmuSuccess);
+        CHECK(A650GmuPowerGx(&device, 1, &gx) == A650GmuTimeout && !gx.gx_on && gx.oob_polls == 101 && gx.gx_after == 0xc0);
     }
     /* A GMU not held in reset is refused before any write. */
     {

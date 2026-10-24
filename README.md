@@ -62,7 +62,7 @@ fastboot boot out/pipa/boot/boot.img
 
 ## Stage 4 to 7: kernel, root, iPadOS and the lock screen
 
-State on 2026-10-24: iPadOS 17.7.11 runs to the home screen on all eight cores at their top clocks, from the UFS root, with the display on the firmware frame buffer (QuartzCore's CPU renderer, slow at 1800x2880). Touch (swipe to unlock) and the power and volume keys (lock, wake) work. The Adreno 650's GMU runs (cold start and HFI startup); the GPU itself (GX) is not powered yet. No audio or network yet.
+State on 2026-10-24: iPadOS 17.7.11 runs to the home screen on all eight cores at their top clocks, from the UFS root, with the display on the firmware frame buffer (QuartzCore's CPU renderer, slow at 1800x2880). Touch (swipe to unlock) and the power and volume keys (lock, wake) work. The Adreno 650's GMU runs (cold start and HFI startup) and powers the GPU (GX on at 305 MHz); the GPU does not execute commands yet. No audio or network yet.
 
 One round is one command, with no keys: `scripts/kernel-round.sh [--no-build | --build-only] [--twice] [--arg NAME=VALUE]... [TAIL_LINES]` builds the kernel, payload and boot image against the local IPSW, `fastboot boot`s it, waits until the kernel restarts the tablet into fastboot by itself (a warm reset that keeps the ramoops log: 10 s after a panic, after the third SpringBoard/backboardd crash, or 240 s after boot), reads the log back and prints the kernel's own lines (display, cores, CPU levels, crashes) and the end. `--twice` after a change of `pipa_defconfig`; `--arg sheng-data-reset=1` once after a change that MobileGestalt caches in the Data overlay (the UI scale).
 
@@ -129,7 +129,7 @@ Read under Android 14 (HyperOS 2.0.20) with `android-devinfo` on 2026-10-21; the
 
 ## Next steps
 
-1. GPU: the GX_BW_PERF_VOTE and the OOB request that make the GMU power GX, then the a6xx hardware and CP initialisation of the NativeAdreno fork with `a650_sqe.fw` and the zap shader.
+1. GPU: the a6xx hardware and CP initialisation (UniXNU-tb128fu's GPU probe mode 7 as the template, with the A650's clock gating, register protection, UBWC and APRIV) through the NativeAdreno fork with `a650_sqe.fw`, the zap shader and the exit from secure mode.
 2. Display: the CPU copy to the firmware frame buffer has no vertical sync (tearing, as on UniXNU-tb128fu); later the DSI/MDSS path or a GPU copy.
 3. A UFS log beside the ramoops zone, for resets that do not keep memory.
 

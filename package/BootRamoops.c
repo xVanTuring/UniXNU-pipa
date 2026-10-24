@@ -405,7 +405,7 @@ static void buttons_status(void) {
 }
 // The GPU bring-up (GpuProbe.cpp, pipa-gpu=<mode>): its rows whenever they change, and its step every 10 s while it runs (a hang
 // in a register read leaves the step it was at).
-extern char native_gpu_rows[17][120] __attribute__((weak_import));
+extern char native_gpu_rows[18][120] __attribute__((weak_import));
 extern volatile unsigned native_gpu_changes __attribute__((weak_import));
 extern volatile unsigned native_gpu_step __attribute__((weak_import));
 static void gpu_status(int periodic) {
@@ -419,7 +419,7 @@ static void gpu_status(int periodic) {
   unsigned changes = native_gpu_changes;
   if (changes == logged) return;
   logged = changes;
-  for (unsigned i = 0; i < 17; ++i) touch_row("gpu: ", native_gpu_rows[i], sizeof native_gpu_rows[i]);
+  for (unsigned i = 0; i < 18; ++i) touch_row("gpu: ", native_gpu_rows[i], sizeof native_gpu_rows[i]);
 }
 
 // The lines sheng's progress page shows for other components (KeyStoreProbe.cpp writes line 0); logged with the display line.

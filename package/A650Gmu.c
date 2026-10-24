@@ -320,6 +320,38 @@ failed:
     return status;
 }
 
+enum {GMU_SPTPRAC_PWR_CLK_STATUS = 0x50d0};
+#define GX_OFF_BITS 0xc0u         /* GX_HM_GDSC_POWER_OFF | GX_HM_CLK_OFF */
+#define OOB_GPU_SET_REQUEST 30
+#define OOB_GPU_SET_ACK 31
+static int hfi_wait(void *cookie) {A650GmuDevice *d = cookie; return d->services.wait_us(d->services.cookie, 100);}
+A650GmuStatus A650GmuPowerGx(A650GmuDevice *d, unsigned perf_index, A650GmuGxResult *r)
+{
+    if (!r) return A650GmuArgument;
+    *r = (A650GmuGxResult){0};
+    if (!d || perf_index < 1 || perf_index > 7) return A650GmuArgument;
+    if (d->poisoned || d->hfi.poisoned) return A650GmuPoisoned;
+    if (!d->startup.completed) return A650GmuStateMismatch;
+    A650GmuResult io = {0};
+    if (core_read(d, GMU_SPTPRAC_PWR_CLK_STATUS, &r->gx_before, &io)) return A650GmuIoError;
+    const uint32_t vote[3] = {1, perf_index, 0};
+    uint32_t out[16]; size_t count = 0;
+    r->vote_status = AdrenoHfiExchange(&d->hfi, 30, vote, 3, 1000, hfi_wait, out, 16, &count, &r->vote_error);
+    if (r->vote_status != AdrenoHfiSuccess) return r->vote_status == AdrenoHfiFirmwareError ? A650GmuProtocolError : A650GmuTimeout;
+    if (core_write(d, GMU_HOST2GMU_INTR_SET, 1u << OOB_GPU_SET_REQUEST, &io) || d->io.barrier(d->io.cookie)) return A650GmuIoError;
+    A650GmuStatus status = A650GmuTimeout;
+    for (r->oob_polls = 1; r->oob_polls <= 100; ++r->oob_polls) {
+        if (core_read(d, GMU_GMU2HOST_INTR_INFO, &r->oob_info, &io)) return A650GmuIoError;
+        if (r->oob_info & (1u << OOB_GPU_SET_ACK)) {status = A650GmuSuccess; break;}
+        if (d->services.wait_us(d->services.cookie, 100)) return A650GmuClockError;
+    }
+    if (core_write(d, GMU_GMU2HOST_INTR_CLR, 1u << OOB_GPU_SET_ACK, &io) || d->io.barrier(d->io.cookie)) return A650GmuIoError;
+    if (core_read(d, GMU_SPTPRAC_PWR_CLK_STATUS, &r->gx_after, &io)) return A650GmuIoError;
+    r->gx_on = status == A650GmuSuccess && !(r->gx_after & GX_OFF_BITS);
+    if (status == A650GmuSuccess && !r->gx_on) status = A650GmuStateMismatch;
+    return status;
+}
+
 AdrenoHfiStartupStatus A650GmuBuildStartup(const uint8_t *gfx, size_t gfx_bytes, const uint8_t *mx, size_t mx_bytes,
     const uint8_t *cx, size_t cx_bytes, uint32_t mc0, uint32_t sh0, uint32_t acv, uint32_t cn0, AdrenoHfiStartupConfig *out)
 {
