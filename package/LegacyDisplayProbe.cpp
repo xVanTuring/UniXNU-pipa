@@ -193,6 +193,8 @@ static SwapEvent swapEvents[64];static uint32_t swapEventCount;
 // UI at rest), counted, summed and sorted into gaps of up to 17, 34, 50, 67, 100 and 200 ms (about 1, 2, 3, 4, 6 and 12 refreshes at
 // 60 Hz), and each swap's submit-to-retire time. The averages over a whole round mix motion with rest; these do not.
 static uint64_t pacingLast,pacingFrames,pacingUs,pacingGaps[6],retireCount,retireUs,retireMax;
+// The longest moving gap since the last native_legacy_swap_pacing_sample, for one scripted step's animation (Gestures.c).
+static uint64_t pacingWorst;
 extern "C" void native_legacy_swap_stage(unsigned stage) {
     const uint64_t now=probeNowUs();
     uint32_t total=swapEventCount;
@@ -201,6 +203,7 @@ extern "C" void native_legacy_swap_stage(unsigned stage) {
             const uint64_t gap=now-pacingLast;
             pacingFrames++;pacingUs+=gap;
             pacingGaps[gap<=17000?0:gap<=34000?1:gap<=50000?2:gap<=67000?3:gap<=100000?4:5]++;
+            if(gap>pacingWorst)pacingWorst=gap;
         }
         pacingLast=now;
         SwapEvent &e=swapEvents[total%64];e={now,0,0,total+1};swapEventCount=total+1;return;
@@ -216,6 +219,13 @@ extern "C" void native_legacy_swap_stage(unsigned stage) {
             return;
         }
     }
+}
+// The pacing counters as they stand (moving frames, their microseconds, the six gap classes, the longest gap since the last sample), for a
+// difference across one step; the longest gap starts over.
+extern "C" void native_legacy_swap_pacing_sample(uint64_t out[9]) {
+    out[0]=pacingFrames;out[1]=pacingUs;
+    for(unsigned i=0;i<6;++i)out[2+i]=pacingGaps[i];
+    out[8]=pacingWorst;pacingWorst=0;
 }
 extern "C" unsigned native_legacy_swap_pacing(char *out,unsigned cap) {
     const uint64_t frames=pacingFrames,us=pacingUs,retired=retireCount;

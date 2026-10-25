@@ -325,6 +325,12 @@ enum {GMU_SPTPRAC_PWR_CLK_STATUS = 0x50d0};
 #define OOB_GPU_SET_REQUEST 30
 #define OOB_GPU_SET_ACK 31
 static int hfi_wait(void *cookie) {A650GmuDevice *d = cookie; return d->services.wait_us(d->services.cookie, 100);}
+/* Whether the GMU votes DDR bandwidth for the GPU (A650GmuBuildStartup's second bandwidth level, chosen by A650GmuPowerGx). Linux votes
+ * the GPU's DDR bandwidth from the kernel through the interconnect framework and gives the GMU an "off" level only; this kernel has no
+ * RPMh voter of its own, so without the GMU's vote the GPU ran on whatever DDR level the rest of the system left (2026-10-25: the scanout
+ * copy moved 41 MB in 2.6 ms, about 16 GB/s, where the LPDDR5 reaches twice that). kgsl lets the GMU vote the same BCMs. 0 by default
+ * (the host tests' table), the board sets it. */
+unsigned A650GmuDdrVote;
 A650GmuStatus A650GmuPowerGx(A650GmuDevice *d, unsigned perf_index, A650GmuGxResult *r)
 {
     if (!r) return A650GmuArgument;
@@ -334,7 +340,7 @@ A650GmuStatus A650GmuPowerGx(A650GmuDevice *d, unsigned perf_index, A650GmuGxRes
     if (!d->startup.completed) return A650GmuStateMismatch;
     A650GmuResult io = {0};
     if (core_read(d, GMU_SPTPRAC_PWR_CLK_STATUS, &r->gx_before, &io)) return A650GmuIoError;
-    const uint32_t vote[3] = {1, perf_index, 0};
+    const uint32_t vote[3] = {1, perf_index, A650GmuDdrVote ? 1u : 0u};
     uint32_t out[16]; size_t count = 0;
     r->vote_status = AdrenoHfiExchange(&d->hfi, 30, vote, 3, 1000, hfi_wait, out, 16, &count, &r->vote_error);
     if (r->vote_status != AdrenoHfiSuccess) return r->vote_status == AdrenoHfiFirmwareError ? A650GmuProtocolError : A650GmuTimeout;
@@ -370,11 +376,17 @@ AdrenoHfiStartupStatus A650GmuBuildStartup(const uint8_t *gfx, size_t gfx_bytes,
     if (AdrenoHfiArcVotes(gmu_level, 2, cx, cx_bytes, mx, mx_bytes, votes, 16)) return AdrenoHfiStartupInvalid;
     c.gmu_count = 2;
     for (unsigned i = 0; i < 2; ++i) c.gmu[i] = (AdrenoHfiPerformanceLevel){gmu_hz[i], votes[i]};
-    /* a650_build_bw_table: one "off" level; the DDR commands MC0, SH0, ACV and the CNOC command CN0, in that order. */
-    c.bandwidth_count = 1;
+    /* a650_build_bw_table: one "off" level; the DDR commands MC0, SH0, ACV and the CNOC command CN0, in that order. With A650GmuDdrVote a
+     * second level asks the most of MC0 and SH0 (BCM_TCS_CMD commit and valid, vote_x = vote_y = 0x3fff: the BCMs take their top level)
+     * and sets ACV's bit 3, sm8250's bcm_acv enable_mask (Linux icc-rpmh sm8250.c). */
+    c.bandwidth_count = A650GmuDdrVote ? 2 : 1;
     c.ddr_count = 3; c.ddr_wait_mask = 1;
     c.ddr_addresses[0] = mc0; c.ddr_addresses[1] = sh0; c.ddr_addresses[2] = acv;
     c.ddr_data[0][0] = c.ddr_data[0][1] = c.ddr_data[0][2] = 0x40000000u;
+    if (A650GmuDdrVote) {
+        c.ddr_data[1][0] = c.ddr_data[1][1] = 0x60000000u | (0x3fffu << 14) | 0x3fffu;
+        c.ddr_data[1][2] = 0x60000008u;
+    }
     c.cnoc_count = 1; c.cnoc_wait_mask = 1;
     c.cnoc_addresses[0] = cn0;
     c.cnoc_data[0][0] = 0x40000000u; c.cnoc_data[1][0] = 0x60000001u;

@@ -255,11 +255,9 @@ kernel_args = [
   # (2026-10-25: the App Library page's full-screen pass went from 95 ms of GPU time to 2 ms, and the UI from 41 to 47 frames a second).
   # Experiment 2026-10-25 evening: letting Core Animation see the Apple families again is slower, not faster: a pass
   # went from 7.5 to 12.5 ms of GPU time and submit-to-retire from 9.3 to 18.1 ms (App Library windows, one round
-  # each, 2026-10-25). The withhold keeps the cheaper path.
-  "pipa-metal-withhold=apple-families",
-  # The GPU at its top level, 670 MHz (GX_BW_PERF_VOTE level 7): the plugin's scanout copy of a frame took 5 ms against 12 ms at
-  # 305 MHz (2026-10-24).
-  "pipa-gpu-perf=7",
+  # each, 2026-10-25). The withhold keeps the cheaper path. It is GpuProbe.cpp's default now (pipa-metal-withhold=none reports the
+  # families), and so is the GPU's top level, 670 MHz (GX_BW_PERF_VOTE level 7; pipa-gpu-perf=<1..7>): the plugin's scanout copy of a
+  # frame took 5 ms against 12 ms at 305 MHz (2026-10-24). Both arguments' 52 bytes went back to the command line.
   # The GPU addon of the payload (the Metal plugin, Turnip, adrenoprobed; scripts/kernel-round.sh passes it) written into the Data
   # volume and mounted before launchd starts; the name is UniXNU-sheng's.
   "sheng-gpu-addon=1",

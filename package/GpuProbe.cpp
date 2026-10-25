@@ -15,7 +15,7 @@
 //      two exact routes, 5 on SMR 2 and 0x405 on SMR 3), a write-combined CPU view of its five regions, and the A650 cold start
 //      (package/A650Gmu.c) with the embedded a650_gmu.bin and the HFI tables built from the command DB. GX stays off.
 //   8  as 7, then, only after a complete cold start: GX power through the GMU (A650GmuPowerGx: the GX_BW_PERF_VOTE for the GPU
-//      level `pipa-gpu-perf=<1..7>`, default 1 = 305 MHz, where Linux starts at the top one; then the OOB GPU_SET request), and
+//      level `pipa-gpu-perf=<1..7>`, default 7 = 670 MHz, the top one, where Linux starts too; then the OOB GPU_SET request), and
 //      with GX on the GX GDSC, RBBM_STATUS and both GBIF halt registers, read only.
 //   9  as 8, then, with GX on, the first GPU command, after UniXNU-tb128fu's GPU probe mode 7 (naContext, naHwInit, naCp): the
 //      GPU's own SMMU context through NativeAdreno (bank 0 / ASID 2, the GPU's streams 0, 1, 0x400 and 0x401 of its DT iommus
@@ -315,6 +315,11 @@ void gmuColdStart(const gpb_result &r, const gpb_gmu_clock_on &o) {
     gDevice.io = {nullptr, {A650_GMU_CORE_BYTES, A650_GMU_RSCC_BYTES, A650_GMU_PDC_BYTES}, gmuRead, gmuWrite, gmuBarrier};
     gDevice.services = {nullptr, gmuNow, gmuWait};
     gConfig = {A650_GMU_CHIP_ID, native_gpu_gmu_firmware, native_gpu_gmu_firmware_size, views[0], views[1], views[3], views[4], 100};
+    // The GMU's DDR vote for the GPU (A650Gmu.c A650GmuDdrVote): off unless pipa-gpu-bw=1 (2026-10-25: with it on, neither the GPU's
+    // frame times nor the scanout copy changed, so the DDR was not what held them back).
+    unsigned ddrVote = 0;
+    PE_parse_boot_argn("pipa-gpu-bw", &ddrVote, sizeof ddrVote);
+    A650GmuDdrVote = ddrVote ? 1 : 0;
     const AdrenoHfiStartupStatus built = A650GmuBuildStartup(gDbFound[0].aux, gDbFound[0].aux_bytes, gDbFound[1].aux,
         gDbFound[1].aux_bytes, gDbFound[2].aux, gDbFound[2].aux_bytes, gDbFound[5].address, gDbFound[4].address,
         gDbFound[6].address, gDbFound[7].address, &gStartup);
@@ -357,10 +362,76 @@ uint32_t gpuRead(uint32_t dword) {
     rd(nullptr, GPB_WIN_GPU, dword * 4, &v);
     return v;
 }
+// The DDR and its interconnect at their top levels, voted from this kernel through the application processor's RSC, as Linux's
+// rpmh-rsc driver sends an active-only request (drivers/soc/qcom/rpmh-rsc.c) and as the UEFI's RpmhDxe did at boot. The AOP's DDR
+// statistics (BootRamoops.c ddr_status) showed the DDR at 1555 MHz for the whole session, where the LPDDR5 runs up to 2736 MHz,
+// and the GMU's own bandwidth vote (A650GmuDdrVote) changed nothing (2026-10-25); the GPU's copies moved about 16 GB/s, which is what
+// 1555 MHz carries. The vote sends MC0 and SH0 at vote_x = vote_y = 0x3fff (each BCM takes its top level) and ACV's bit 3 (sm8250's
+// bcm_acv enable_mask), commit and valid set, through active TCS 0 of DRV 2 (the downstream DTS: apps_rsc drv-2 at 0x18220000,
+// qcom,tcs-offset 0xd00, tcs-config ACTIVE 2, SLEEP 3, WAKE 3, CONTROL 1), waiting for each command's completion. On the tablet
+// (2026-10-25, round 223524) all three completed in 0.3 ms and the scanout copy went from 2.69 to 1.66 ms, a full-screen pass from
+// 2.40 to 1.91 ms, the render thread's frame from 13.3 to 10.8 ms of CPU, an app's opening from 38 to 44 frames a second. On by
+// default (the DDR stays at its top level: more power while the tablet idles); pipa-ddr-vote=0 leaves the UEFI's level. The result
+// goes to the row after the CP's state (kRowHang2), which a hang would reuse.
+extern "C" uint64_t ml_io_map(uint64_t phys_addr, uint64_t size);
+void rpmhVoteDdr() {
+    unsigned vote = 1;
+    PE_parse_boot_argn("pipa-ddr-vote", &vote, sizeof vote);
+    if (!vote) return;
+    char *row = native_gpu_rows[kRowHang2];
+    const size_t cap = sizeof native_gpu_rows[0];
+    const uint32_t mc0 = gDbFound[5].address, sh0 = gDbFound[4].address, acv = gDbFound[6].address;
+    if (!mc0 || !sh0 || !acv) {snprintf(row, cap, "DDRV no BCM addresses %x %x %x", mc0, sh0, acv); changed(); return;}
+    volatile uint32_t *drv = (volatile uint32_t *)(uintptr_t)ml_io_map(0x18220000, 0x10000);
+    if (!drv) {snprintf(row, cap, "DDRV no mapping"); changed(); return;}
+    auto r = [&](uint32_t off) {return drv[off / 4];};
+    auto w = [&](uint32_t off, uint32_t v) {drv[off / 4] = v; __asm__ volatile("dsb sy" ::: "memory");};
+    const uint32_t config = r(0x0C);                                   // DRV_PRNT_CHLD_CONFIG
+    const uint32_t tcsCount = (config >> 12) & 0x3f, perTcs = (config >> 27) & 0x1f;   // drv-id 2: bits 17:12; NCPT bits 31:27
+    constexpr uint32_t kTcsBase = 0xd00, kTcsStride = 672, kCmdStride = 20;
+    auto tcs = [&](unsigned id, uint32_t reg) {return kTcsBase + kTcsStride * id + reg;};
+    unsigned id = 0;
+    for (; id < 2; ++id) if (r(tcs(id, 0x18))) break;                 // RSC_DRV_STATUS nonzero: idle
+    if (id == 2 || tcsCount < 2 || perTcs < 3) {
+        snprintf(row, cap, "DDRV refused: config %08x (tcs %u, cmds %u), status %08x %08x", config, tcsCount, perTcs, r(tcs(0, 0x18)),
+                 r(tcs(1, 0x18)));
+        changed();
+        return;
+    }
+    const uint32_t top = (1u << 30) | (1u << 29) | (0x3fffu << 14) | 0x3fffu, acvOn = (1u << 30) | (1u << 29) | 0x8u;
+    const uint32_t addrs[3] = {mc0, sh0, acv}, datas[3] = {top, top, acvOn};
+    w(tcs(id, 0x1C), 0);                                                // RSC_DRV_CMD_ENABLE
+    w(kTcsBase + 0x00, r(kTcsBase + 0x00) | (1u << id));                 // RSC_DRV_IRQ_ENABLE: the completion latches in IRQ_STATUS
+    for (unsigned c = 0; c < 3; ++c) {
+        w(tcs(id, 0x30) + kCmdStride * c, 8u | (1u << 16) | (1u << 8));  // MSGID: length 8, write, response required
+        w(tcs(id, 0x34) + kCmdStride * c, addrs[c]);
+        w(tcs(id, 0x38) + kCmdStride * c, datas[c]);
+    }
+    w(tcs(id, 0x1C), 7);
+    uint32_t control = r(tcs(id, 0x14));                                 // RSC_DRV_CONTROL: AMC trigger off, AMC off, AMC on, trigger
+    control &= ~(1u << 24); w(tcs(id, 0x14), control);
+    control &= ~(1u << 16); w(tcs(id, 0x14), control);
+    w(tcs(id, 0x14), 1u << 16);
+    w(tcs(id, 0x14), (1u << 16) | (1u << 24));
+    unsigned polls = 0;
+    for (; polls < 2000 && !(r(kTcsBase + 0x04) & (1u << id)); ++polls) IODelay(5);   // RSC_DRV_IRQ_STATUS
+    uint32_t status[3];
+    for (unsigned c = 0; c < 3; ++c) status[c] = r(tcs(id, 0x3C) + kCmdStride * c);
+    w(kTcsBase + 0x08, 1u << id);                                        // RSC_DRV_IRQ_CLEAR
+    w(tcs(id, 0x1C), 0);
+    w(kTcsBase + 0x00, r(kTcsBase + 0x00) & ~(1u << id));
+    snprintf(row, cap, "DDRV tcs %u of %u (%u cmds) polls %u cmd status %05x %05x %05x | aux mc0 %02x%02x%02x%02x w%u", id, tcsCount,
+             perTcs, polls, status[0], status[1], status[2], gDbFound[5].aux_bytes > 3 ? gDbFound[5].aux[3] : 0,
+             gDbFound[5].aux_bytes > 2 ? gDbFound[5].aux[2] : 0, gDbFound[5].aux_bytes > 1 ? gDbFound[5].aux[1] : 0,
+             gDbFound[5].aux_bytes ? gDbFound[5].aux[0] : 0,
+             gDbFound[5].aux_bytes > 5 ? gDbFound[5].aux[4] | gDbFound[5].aux[5] << 8 : 0);
+    changed();
+}
+
 void gxOn() {
-    unsigned perf = 1;
+    unsigned perf = 7;   // 670 MHz, the top level (it was board.toml's pipa-gpu-perf=7 until 2026-10-25)
     PE_parse_boot_argn("pipa-gpu-perf", &perf, sizeof perf);
-    if (perf < 1 || perf > 7) perf = 1;
+    if (perf < 1 || perf > 7) perf = 7;
     native_gpu_step = 100;
     A650GmuGxResult &g = native_gpu_gx;
     const A650GmuStatus status = A650GmuPowerGx(&gDevice, perf, &g);
@@ -378,10 +449,12 @@ void gxOn() {
                  gpuRead(kGbifHaltAck), gpuRead(kRbbmGbifHalt), gpuRead(kRbbmGbifHaltAck));
     }
     changed();
+    rpmhVoteDdr();
 }
 
 // Mode 9. GPU register access for NativeAdreno (dword indices) through the GPU window.
 extern "C" {
+extern volatile uint32_t native_adreno_readonly_imports_owned;
 extern volatile uint32_t native_adreno_smmu_coherent_walk, native_adreno_wc_enabled, native_adreno_written_imports_owned,
     native_adreno_pool_mib;
 NativeAdrenoGmuContextReport native_gpu_context;
@@ -451,7 +524,16 @@ bool gpuContext() {
     native_adreno_smmu_coherent_walk = 0;
     native_adreno_wc_enabled = 1;
     native_adreno_written_imports_owned = 1;
-    unsigned pool = 384;   // MiB, the BO pool taken before memory fragments; pipa-gpu-pool=0 for scattered BOs only
+    // The Metal frontend cleans the read-only imports (the apps' CPU-drawn IOSurfaces) whose seed changed before each commit, so the
+    // kernel does not clean all of them at every submission (2026-10-25: about 7 MB and 1.2 ms a submission while apps opened);
+    // pipa-gpu-ro-own=0 brings the kernel's cleaning back.
+    unsigned readOnlyOwned = 1;
+    PE_parse_boot_argn("pipa-gpu-ro-own", &readOnlyOwned, sizeof readOnlyOwned);
+    native_adreno_readonly_imports_owned = readOnlyOwned ? 1 : 0;
+    // MiB, the BO pool taken before memory fragments; pipa-gpu-pool=0 for scattered BOs only. 768 since Turnip keeps freed BOs for reuse
+    // (tu_knl_darwin.cc BO cache, up to 48 MiB): at 384 the pool ran at 340 of 384 MiB without it (2026-10-25), and a BO past the pool is
+    // scattered pages whose write-combine change and its undoing cost milliseconds each.
+    unsigned pool = 768;
     PE_parse_boot_argn("pipa-gpu-pool", &pool, sizeof pool);
     native_adreno_pool_mib = pool;
     NativeAdrenoGmuContextReport &g = native_gpu_context;
@@ -611,12 +693,48 @@ void ucheRow() {
 // pixels (BINW = width / 32, BINH = height / 16) and where the bin buffers live, VSC_BIN_SIZE the tiler's, RB_CCU_CACHE_CNTL the CCU
 // cache offsets and sizes, and RB_MRT_0_INFO/BASE the first colour target. Decoded, because GMEM passes put 4-row slices of the frame in
 // the wrong place (2026-10-24) and the bin size says which tiling the hardware was actually asked to render.
-void tilingRow() {
+__attribute__((unused)) void tilingRow() {
     const uint32_t rb = gpuRead(0x8800), gras = gpuRead(0x80A1), vsc = gpuRead(0x0C02);
     char line[sizeof native_gpu_rows[0]];
     snprintf(line, sizeof line, "TILE bin %ux%u rb %08x gras %08x vsc %ux%u | mrt0 %08x %08x%08x vrs %08x",
              (gras & 0x3f) * 32, ((gras >> 8) & 0x7f) * 16, rb, gras, (vsc & 0xff) * 32, ((vsc >> 8) & 0x1ff) * 16,
              gpuRead(0x8822), gpuRead(0x8824), gpuRead(0x8823), gpuRead(0x88F4));
+    if (strncmp(line, native_gpu_rows[kRowTiling], sizeof line)) {
+        strlcpy(native_gpu_rows[kRowTiling], line, sizeof native_gpu_rows[0]);
+        changed();
+    }
+}
+
+// The kernel side of a submission (NativeAdrenoSubmit.cpp native_adreno_submit_phase), in the tiling row's place while the frame rate is
+// the question (2026-10-25: Turnip's Submit call took 1 to 1.4 ms of the render thread): microseconds a submission for the buffers'
+// validation, the job sweep and references, the write-combine re-assertion and audit, the BO publication, the TLB invalidation and the
+// ring write, and the submissions counted.
+extern "C" volatile uint64_t native_adreno_submit_phase[7] __attribute__((weak_import));
+// With the cache maintenance behind the publication: passes, MB and ms so far (NativeAdrenoCpu.cpp), the submission at which the
+// write-combine audit stopped trusting the client views (0 = never) and the pages the re-assertion found back at the default attribute.
+extern "C" volatile uint64_t native_adreno_cache_stats[5] __attribute__((weak_import));
+extern "C" volatile uint32_t native_adreno_wc_distrusted __attribute__((weak_import));
+extern "C" volatile uint32_t native_adreno_wc_audit[6] __attribute__((weak_import));
+void submitRow() {
+    if (!&native_adreno_submit_phase) return;
+    const uint64_t n = native_adreno_submit_phase[6];
+    if (!n) return;
+    uint64_t us[6];
+    for (unsigned i = 0; i < 6; ++i) {
+        uint64_t ns = 0;
+        absolutetime_to_nanoseconds(native_adreno_submit_phase[i], &ns);
+        us[i] = ns / 1000 / n;
+    }
+    char line[sizeof native_gpu_rows[0]];
+    uint64_t maintained_ns = 0;
+    if (&native_adreno_cache_stats) absolutetime_to_nanoseconds(native_adreno_cache_stats[0], &maintained_ns);
+    snprintf(line, sizeof line, "SUBT n%llu us check %llu sweep %llu wc %llu pub %llu tlb %llu ring %llu | mt %llu %lluMB %llums d%u r%u",
+             (unsigned long long)n, (unsigned long long)us[0], (unsigned long long)us[1], (unsigned long long)us[2],
+             (unsigned long long)us[3], (unsigned long long)us[4], (unsigned long long)us[5],
+             &native_adreno_cache_stats ? (unsigned long long)native_adreno_cache_stats[3] : 0ull,
+             &native_adreno_cache_stats ? (unsigned long long)(native_adreno_cache_stats[1] >> 20) : 0ull,
+             (unsigned long long)(maintained_ns / 1000000), &native_adreno_wc_distrusted ? native_adreno_wc_distrusted : 0u,
+             &native_adreno_wc_audit ? native_adreno_wc_audit[5] : 0u);
     if (strncmp(line, native_gpu_rows[kRowTiling], sizeof line)) {
         strlcpy(native_gpu_rows[kRowTiling], line, sizeof native_gpu_rows[0]);
         changed();
@@ -1114,7 +1232,11 @@ bool metal() {
             "pipa_gmemin,pipa_iaflush",          // 2 invalidate the UCHE before every draw that reads GMEM
             "pipa_gmemin,pipa_iaplain",          // 3 read them through their sysmem descriptor instead
             "pipa_gmemin,pipa_uchegmem",         // 4 program UCHE_GMEM_RANGE from Turnip itself
-            "pipa_gmemin,pipa_iaflush,pipa_uchegmem"};  // 5 both
+            "pipa_gmemin,pipa_iaflush,pipa_uchegmem",   // 5 both
+            "sysmem",                            // 6 every pass in system memory (GPU time against GMEM, 2026-10-25)
+            "gmem",                              // 7 every pass in GMEM, the autotuner's sysmem picks too
+            "pipa_small-262144",                 // 8 passes up to 512x512 in system memory
+            "nolrz"};                            // 9 no low-resolution Z
         if (canned < sizeof sets / sizeof sets[0]) snprintf(turnip, sizeof turnip, "%s", sets[canned]);
     }
     accelerator->setProperty("NativeTurnipDebug", turnip);
@@ -1122,8 +1244,11 @@ bool metal() {
     // apple-families answers no to every Apple GPU family, as UniXNU-tb128fu does (Core Animation blends by framebuffer fetch on an
     // Apple1 device, NativeBridgeMetalFrontend.mm). With the families reported, the home screen's widget platters had their rounded
     // corners drawn in 4 x 4 pixel blocks with holes (2026-10-24).
-    char withhold[64] = "";
-    if (PE_parse_boot_arg_str("pipa-metal-withhold", withhold, sizeof withhold) && withhold[0])
+    // apple-families is the default since 2026-10-25 (it was board.toml's argument, 35 bytes of the 1000-byte command line);
+    // pipa-metal-withhold=none reports the families again.
+    char withhold[64] = "apple-families";
+    PE_parse_boot_arg_str("pipa-metal-withhold", withhold, sizeof withhold);
+    if (withhold[0] && strcmp(withhold, "none"))
         accelerator->setProperty("NativeMetalWithhold", withhold);
     stage = 4;
     if (!accelerator->attach(IOService::getPlatform())) {accelerator->release(); return stop(kIOReturnNotAttached);}
@@ -1216,7 +1341,7 @@ void hangRows(unsigned t) {
             changed();
         }
         ucheRow();
-        tilingRow();
+        submitRow();
         static bool oobDumped;
         if (!oobDumped && (gIrqSeen & (1u << 24))) {oobDumped = true; regDump("oob");}   // RBBM_INT_0 UCHE_OOB_ACCESS
         IOSleep(2000);

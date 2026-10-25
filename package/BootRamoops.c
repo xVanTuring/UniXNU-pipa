@@ -600,6 +600,8 @@ static void battery_status(void) {
 extern char native_gesture_rows[8][120] __attribute__((weak_import));
 extern volatile unsigned native_gesture_written __attribute__((weak_import));
 extern volatile int native_gesture_error __attribute__((weak_import));
+extern char native_gesture_timeline[4096] __attribute__((weak_import));
+extern volatile unsigned native_gesture_timeline_seq __attribute__((weak_import));
 static void gesture_status(void) {
   static unsigned logged, error_logged;
   if (!&native_gesture_rows || !&native_gesture_written || !&native_gesture_error) return;
@@ -612,7 +614,88 @@ static void gesture_status(void) {
   unsigned written = native_gesture_written;
   if (written - logged > 8) logged = written - 8;
   for (; logged < written; ++logged) touch_row("gesture: ", native_gesture_rows[logged & 7], sizeof native_gesture_rows[0]);
+  // The swap timeline the script kept at the end of an animation (Gestures.c anim_timeline), once per copy.
+  static unsigned timeline_logged;
+  if (&native_gesture_timeline && &native_gesture_timeline_seq && native_gesture_timeline_seq != timeline_logged) {
+    timeline_logged = native_gesture_timeline_seq;
+    char text[128];
+    for (const char *at = native_gesture_timeline; *at;) {
+      const char *end = at;
+      while (*end && *end != '\n') ++end;
+      unsigned n = (unsigned)(end - at) < sizeof text - 1 ? (unsigned)(end - at) : sizeof text - 1;
+      for (unsigned i = 0; i < n; ++i) text[i] = at[i];
+      text[n] = 0;
+      line("swaps: ", text);
+      at = *end ? end + 1 : end;
+    }
+  }
 }
+// The DDR's frequency residency, from the AOP's DDR statistics in its message RAM (downstream DTS qcom,ddr-stats@c3f0000: the table at
+// 0xC300000 plus the offset word at 0xC3F001C, 0xF00B8 on the tablet; msm-4.19 soc_sleep_stats.c): a magic word, the entry count, then per entry a name word
+// (bits 15:8 1 for a frequency, its MHz in bits 31:16), a count and a 64-bit time in 19.2 MHz ticks. Every 10 s the frequencies whose
+// time grew since the last row, with the milliseconds they took: which DDR level the GPU and the CPUs actually ran on (2026-10-25: the
+// GPU's copies moved about 16 GB/s, half of what the LPDDR5 at 2736 MHz carries, and the GMU's bandwidth vote changed nothing).
+#define AOP_MSG_RAM 0xC300000UL
+#define DDR_STATS_OFFSET_WORD 0xC3F001CUL
+#define DDR_STATS_MAGIC 0xA1157A75U
+static void ddr_status(void) {
+  static volatile u32 *stats, *offset_page;
+  static u64 last[32];
+  static u32 mhz[32];
+  static int failed;
+  if (failed) return;
+  static u32 offset;
+  if (!stats) {
+    offset_page = (volatile u32 *)ml_io_map(DDR_STATS_OFFSET_WORD & ~0xFFFUL, 0x1000);
+    if (!offset_page) {failed = 1; line("ddr: ", "no mapping"); return;}
+    offset = offset_page[(DDR_STATS_OFFSET_WORD & 0xFFFUL) / 4];
+    // The table and its 32 entries in one mapping: two pages from the table's own.
+    const u64 table = AOP_MSG_RAM + offset;
+    if ((offset & 3) || offset >= 0x100000) {
+      char text[64];
+      snprintf(text, sizeof text, "stats offset %x outside the message RAM", offset);
+      line("ddr: ", text); failed = 1; return;
+    }
+    volatile u8 *pages = (volatile u8 *)ml_io_map(table & ~0xFFFUL, 0x2000);
+    if (!pages) {failed = 1; line("ddr: ", "no table mapping"); return;}
+    stats = (volatile u32 *)(pages + (table & 0xFFFUL));
+  }
+  const u32 magic = stats[0], count = stats[1];
+  if (magic != DDR_STATS_MAGIC || !count || count > 32 || ((AOP_MSG_RAM + offset) & 0xFFFUL) + 8 + count * 16 > 0x2000) {
+    char text[80];
+    snprintf(text, sizeof text, "no DDR statistics at %x: magic %08x count %u", offset, magic, count);
+    line("ddr: ", text); failed = 1; return;
+  }
+  // The raw table at the first row and every 60 s after it: whether the AOP keeps it current without being asked.
+  static unsigned calls;
+  if (calls++ % 6 == 0) {
+    char raw[220];
+    unsigned at = (unsigned)snprintf(raw, sizeof raw, "table at %x: %u entries", offset, count);
+    for (u32 i = 0; i < count && at + 30 < sizeof raw; ++i) {
+      volatile u32 *entry = stats + 2 + i * 4;
+      at += (unsigned)snprintf(raw + at, sizeof raw - at, " %x/%u/%llu", entry[0], entry[1],
+                               (unsigned long long)(((u64)entry[2] | ((u64)entry[3] << 32)) / 19200));
+      if (at > 160) {line("ddr: ", raw); at = (unsigned)snprintf(raw, sizeof raw, "...");}
+    }
+    line("ddr: ", raw);
+  }
+  char text[200];
+  unsigned at = (unsigned)snprintf(text, sizeof text, "MHz:ms");
+  u64 total = 0;
+  for (u32 i = 0; i < count && at + 16 < sizeof text; ++i) {
+    volatile u32 *entry = stats + 2 + i * 4;
+    const u32 name = entry[0];
+    const u64 ticks = (u64)entry[2] | ((u64)entry[3] << 32);
+    if (((name >> 8) & 0xFF) != 1) continue;   // a low-power mode, not a frequency
+    const u64 grew = last[i] && ticks >= last[i] ? ticks - last[i] : 0;
+    last[i] = ticks;
+    mhz[i] = name >> 16;
+    total += grew;
+    if (grew >= 19200) at += (unsigned)snprintf(text + at, sizeof text - at, " %u:%llu", mhz[i], grew / 19200);
+  }
+  if (total) line("ddr: ", text);
+}
+
 // The GPU bring-up (GpuProbe.cpp, pipa-gpu=<mode>): each row whose text changed, and its step every 10 s while it runs (a hang
 // in a register read leaves the step it was at). Once the device is published its live row changes every few seconds; only that
 // row is written then.
@@ -1069,7 +1152,7 @@ static void writer(void *argument, int result) {
   for (u32 pass = 1;; ++pass) {
     messages();
     panic_text(0);
-    if (pass % 100 == 0) {display_status(); cpu_status(); touch_status(); gpu_stack_status(); framebuffer_status(); process_status(0);}
+    if (pass % 100 == 0) {display_status(); cpu_status(); touch_status(); gpu_stack_status(); framebuffer_status(); process_status(0); ddr_status();}
     if (pass == 2000) process_status(1);   // the UI's stacks 200 s after the zone was mapped
     // Two corner crops every 50 s: a round can end on a panic before the 200 s mark (2026-10-24's unaligned_store round did), and
     // the crops of a round that turned the pages are the ones worth reading.

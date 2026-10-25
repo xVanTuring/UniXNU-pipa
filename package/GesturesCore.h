@@ -31,6 +31,18 @@
 // The tap after them.
 #define GESTURE_TAP_X 900
 #define GESTURE_TAP_Y 2000
+// The App Library's list, scrolled through its middle (script 1).
+#define GESTURE_PAGE_X_MIDDLE 900
+#define GESTURE_SCROLL_LOW_Y 2200
+#define GESTURE_SCROLL_HIGH_Y 1000
+// The dock's five icons (script 2), from the frame buffer pictures of 2026-10-25 (fbpic row 34, 40 x 80 pixel cells): icons in columns
+// 13-15, 17-19, 21-23, 25-27 and 29-31 at y 2760, the dock platter alone at y 2680, nothing at y 2840. Above the edge band (2812).
+#define GESTURE_DOCK_Y 2760
+#define GESTURE_DOCK_X1 580
+#define GESTURE_DOCK_X2 740
+#define GESTURE_DOCK_X3 900
+#define GESTURE_DOCK_X4 1060
+#define GESTURE_DOCK_X5 1220
 
 static inline int gesture_touch_x(int px) {return px * GESTURE_TOUCH_X_UNITS / GESTURE_PANEL_WIDTH;}
 static inline int gesture_touch_y(int py) {return py * GESTURE_TOUCH_Y_UNITS / GESTURE_PANEL_HEIGHT;}
