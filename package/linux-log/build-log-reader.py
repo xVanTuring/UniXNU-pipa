@@ -40,11 +40,11 @@ def tool(name):
     return str(found)
 
 
-def build_init(work):
+def build_init(work, power_off=False):
     out = work / 'init'
     subprocess.run([tool('clang'), '--target=aarch64-linux-gnu', '-O2', '-ffreestanding', '-fno-builtin', '-fno-stack-protector',
                     '-fno-pic', '-static', '-nostdlib', '-fuse-ld=lld', '-Wl,--no-pie', '-Wl,-e,start', '-Wall', '-Werror',
-                    '-o', out, HERE / 'init.c'], check=True)
+                    *(['-DREADER_POWER_OFF'] if power_off else []), '-o', out, HERE / 'init.c'], check=True)
     header = subprocess.run([tool('llvm-readelf'), '-h', out], capture_output=True, text=True, check=True).stdout
     if 'EXEC (Executable file)' not in header or 'AArch64' not in header:
         raise SystemExit('init is not a static AArch64 executable')
@@ -181,6 +181,7 @@ def main():
     ap.add_argument('--vendor-boot', required=True, type=Path, help="the tablet's own vendor_boot image (header v3)")
     ap.add_argument('--out', required=True, type=Path)
     ap.add_argument('--cold', action='store_true', help='keep the stock hard reset when the reader restarts')
+    ap.add_argument('--poweroff', action='store_true', help='an init that powers the tablet off at once (nothing is read)')
     a = ap.parse_args()
     kernel, os_version = read_boot_v3(a.boot)
     cmdline, kernel_addr, ramdisk_addr, tags_addr, dtb_addr, dtb_section = read_vendor_boot_v3(a.vendor_boot)
@@ -194,7 +195,7 @@ def main():
         if not a.cold:
             dtbs, changed = warm_dtbs(dtbs, work)
         dtb = b''.join(dtbs)
-        init = build_init(work)
+        init = build_init(work, a.poweroff)
         image, offsets = build_image(work)
     entries = [(d, 0o40755, 0, 0, b'') for d in ('dev', 'sys', 'proc')]
     entries += [('dev/console', 0o20600, 5, 1, b''), ('init', 0o100755, 0, 0, init),

@@ -304,8 +304,20 @@ static void reboot_bootloader(void)
   sys(SysReboot, (long)0xfee1dead, 672274793, (long)0xa1b2c3d4, (long)"bootloader", 0);
 }
 
+// The power-off build (build-log-reader.py --poweroff, -DREADER_POWER_OFF): the stock kernel's power off, which drives the PMIC's
+// shutdown (fastboot oem poweroff answers OKAY and does nothing on this tablet), for leaving it off after a session.
+static void power_off(void)
+{
+  sys(SysSync, 0, 0, 0, 0, 0);
+  sys(SysReboot, (long)0xfee1dead, 672274793, (long)0x4321fedc, 0, 0);
+}
+
 __attribute__((noreturn)) void start(void)
 {
+#ifdef READER_POWER_OFF
+  power_off();
+  for (;;) sys(SysExit, 1, 0, 0, 0, 0);
+#endif
   sys(SysMkdirat, AtFdcwd, (long)"/dev", 0755, 0, 0);
   sys(SysMkdirat, AtFdcwd, (long)"/sys", 0755, 0, 0);
   sys(SysMkdirat, AtFdcwd, (long)"/proc", 0755, 0, 0);
