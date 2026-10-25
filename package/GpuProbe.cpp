@@ -1236,7 +1236,10 @@ bool metal() {
             "sysmem",                            // 6 every pass in system memory (GPU time against GMEM, 2026-10-25)
             "gmem",                              // 7 every pass in GMEM, the autotuner's sysmem picks too
             "pipa_small-262144",                 // 8 passes up to 512x512 in system memory
-            "nolrz"};                            // 9 no low-resolution Z
+            "nolrz",                             // 9 no low-resolution Z
+            "pipa_gmemplain",                    // 10 passes whose draws read no input attachment may take GMEM
+            "pipa_gmemplain,gmem",               // 11 and take it whenever it fits
+            "pipa_fbloop"};                      // 12 the single primitive mode only for the pipelines that read one
         if (canned < sizeof sets / sizeof sets[0]) snprintf(turnip, sizeof turnip, "%s", sets[canned]);
     }
     accelerator->setProperty("NativeTurnipDebug", turnip);

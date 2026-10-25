@@ -645,17 +645,55 @@ extern volatile u64 native_ufs_block_reads __attribute__((weak_import));
 extern volatile u64 native_ufs_block_failures __attribute__((weak_import));
 extern volatile u64 native_ufs_read_ticks __attribute__((weak_import));
 extern volatile u64 native_ufs_verify_ticks __attribute__((weak_import));
+static void ufs_readers_status(void);
 static void ufs_status(void) {
   if (!&native_ufs_block_reads || !&native_ufs_read_ticks || !&native_ufs_verify_ticks) return;
   static u64 last_reads, last_read, last_verify;
   const u64 reads = native_ufs_block_reads, read = native_ufs_read_ticks, verify = native_ufs_verify_ticks;
   if (reads == last_reads) return;
+  ufs_readers_status();
   const u64 hz = ticks_per_second() ? ticks_per_second() : 1;
   char text[160];
   snprintf(text, sizeof text, "requests %lu (+%lu) transport %lu ms (+%lu) hash %lu ms (+%lu) failures %lu", reads, reads - last_reads,
            read * 1000 / hz, (read - last_read) * 1000 / hz, verify * 1000 / hz, (verify - last_verify) * 1000 / hz,
            &native_ufs_block_failures ? native_ufs_block_failures : 0);
   last_reads = reads; last_read = read; last_verify = verify;
+  line("ufs: ", text);
+}
+
+// The processes behind the reads (NativeUfs.cpp native_ufs_readers), most blocks first, and the memory the reads refill: free, active,
+// inactive, speculative, wired and compressed pages and jetsam's available pages (16 KiB pages), each 10 s the reads changed.
+struct native_ufs_reader_view {char name[20]; u64 requests, blocks;};
+extern struct native_ufs_reader_view native_ufs_readers[12] __attribute__((weak_import));
+extern unsigned int vm_page_free_count __attribute__((weak_import));
+extern unsigned int vm_page_active_count __attribute__((weak_import));
+extern unsigned int vm_page_inactive_count __attribute__((weak_import));
+extern unsigned int vm_page_speculative_count __attribute__((weak_import));
+extern unsigned int vm_page_wire_count __attribute__((weak_import));
+extern unsigned int memorystatus_available_pages __attribute__((weak_import));
+extern unsigned int c_segment_pages_compressed __attribute__((weak_import));
+static void ufs_readers_status(void) {
+  char text[300];
+  unsigned used = 0;
+  if (&native_ufs_readers) {
+    int shown[12] = {0};
+    used = (unsigned)snprintf(text, sizeof text, "readers");
+    for (unsigned row = 0; row < 6 && used < sizeof text; ++row) {
+      int best = -1;
+      for (int i = 0; i < 12; ++i)
+        if (native_ufs_readers[i].name[0] && !shown[i] && (best < 0 || native_ufs_readers[i].blocks > native_ufs_readers[best].blocks)) best = i;
+      if (best < 0) break;
+      shown[best] = 1;
+      used += (unsigned)snprintf(text + used, sizeof text - used, " %.19s %lu/%luMB", native_ufs_readers[best].name,
+                                 native_ufs_readers[best].requests, native_ufs_readers[best].blocks >> 11);
+    }
+    line("ufs: ", text);
+  }
+  snprintf(text, sizeof text, "memory pages free %u active %u inactive %u speculative %u wired %u compressed %u available %u",
+           &vm_page_free_count ? vm_page_free_count : 0, &vm_page_active_count ? vm_page_active_count : 0,
+           &vm_page_inactive_count ? vm_page_inactive_count : 0, &vm_page_speculative_count ? vm_page_speculative_count : 0,
+           &vm_page_wire_count ? vm_page_wire_count : 0, &c_segment_pages_compressed ? c_segment_pages_compressed : 0,
+           &memorystatus_available_pages ? memorystatus_available_pages : 0);
   line("ufs: ", text);
 }
 
