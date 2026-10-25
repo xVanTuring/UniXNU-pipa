@@ -305,17 +305,41 @@ static void reboot_bootloader(void)
 }
 
 // The power-off build (build-log-reader.py --poweroff, -DREADER_POWER_OFF): the stock kernel's power off, which drives the PMIC's
-// shutdown (fastboot oem poweroff answers OKAY and does nothing on this tablet), for leaving it off after a session.
+// shutdown (fastboot oem poweroff answers OKAY and does nothing on this tablet, and a long power press is a hard reset), for leaving
+// it off after a session. It waits until the USB cable is out: with VBUS present the PMIC powered the tablet straight back on and the
+// bootloader, finding no Android to charge under, went to recovery (2026-10-26). After POWER_OFF_WAIT_S it powers off anyway.
+#ifdef READER_POWER_OFF
+#define POWER_OFF_WAIT_S 600
+// VBUS as the charger driver (qpnp-smb5) sees it: "present" follows the plug, "online" also wants a known charger type.
+#define USB_PRESENT "/sys/class/power_supply/usb/present"
+#define USB_ONLINE "/sys/class/power_supply/usb/online"
+static void sleep_ms(long ms) { long ts[2] = {ms / 1000, (ms % 1000) * 1000000}; sys(SysNanosleep, (long)ts, 0, 0, 0, 0); }
 static void power_off(void)
 {
   sys(SysSync, 0, 0, 0, 0, 0);
   sys(SysReboot, (long)0xfee1dead, 672274793, (long)0x4321fedc, 0, 0);
 }
+static void power_off_unplugged(void)
+{
+  sys(SysMkdirat, AtFdcwd, (long)"/sys", 0755, 0, 0);
+  sys(SysMount, (long)"sysfs", (long)"/sys", (long)"sysfs", 0, 0);
+  char online[8];
+  // Two reads of 0 in a row, half a second apart: the cable is out, not a moment of the charger's renegotiation.
+  for (unsigned tick = 0, zeros = 0; tick < POWER_OFF_WAIT_S * 2; ++tick) {
+    long n = read_file(USB_PRESENT, online, sizeof(online));
+    if (n <= 0) n = read_file(USB_ONLINE, online, sizeof(online));
+    zeros = n > 0 && online[0] == '0' ? zeros + 1 : 0;
+    if (zeros >= 2) break;
+    sleep_ms(500);
+  }
+  power_off();
+}
+#endif
 
 __attribute__((noreturn)) void start(void)
 {
 #ifdef READER_POWER_OFF
-  power_off();
+  power_off_unplugged();
   for (;;) sys(SysExit, 1, 0, 0, 0, 0);
 #endif
   sys(SysMkdirat, AtFdcwd, (long)"/dev", 0755, 0, 0);
