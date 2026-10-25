@@ -253,6 +253,29 @@ extern "C" unsigned native_legacy_prepare_report(char *out,unsigned cap) {
         (unsigned long long)(native_legacy_prepare_wait_us/1000),vsyncHz,(unsigned long long)vsyncEvents[1],(unsigned long long)vsyncEvents[0],
         (unsigned long long)vsyncEvents[2],(unsigned long long)vsyncEvents[3],(unsigned long long)vsyncEvents[4],(unsigned long long)vsyncEvents[5]);
 }
+// The same two subjects as two short lines for the kernel log (BootRamoops.c, display_status, when the text changes): the scanout
+// hand-off's calls/failures/retries/waits, and whether the refresh tick is running. A tick that stops while a client waits is the one
+// failure that would leave the render server with nothing to draw against: sent stops, age grows, wants stays 1.
+extern "C" unsigned native_legacy_vsync_state(uint64_t *,uint64_t *,unsigned *);
+extern "C" unsigned native_legacy_prepare_brief(char *out,unsigned cap) {
+    return snprintf(out,cap,"prep c=%u f=%u r=%u ma=%u w=%llums | vs %uHz sent=%llu arms=%llu idle=%llu late=%llu",
+        native_legacy_prepare_calls,native_legacy_prepare_failures,native_legacy_prepare_retried,native_legacy_prepare_max_attempts,
+        (unsigned long long)(native_legacy_prepare_wait_us/1000),vsyncHz,(unsigned long long)vsyncEvents[1],
+        (unsigned long long)vsyncEvents[0],(unsigned long long)vsyncEvents[2],(unsigned long long)vsyncEvents[3]);
+}
+extern "C" unsigned native_legacy_vsync_brief(char *out,unsigned cap) {
+    uint64_t last=0,interval=0;unsigned rearms=0;
+    const unsigned wants=native_legacy_vsync_state(&last,&interval,&rearms);
+    if(!interval)return snprintf(out,cap,"vs no timer wants=%u",wants);
+    uint64_t age=0;
+    if(last) {
+        uint64_t now=0,was=0;
+        absolutetime_to_nanoseconds(mach_absolute_time(),&now);absolutetime_to_nanoseconds(last,&was);
+        if(now>was)age=(now-was)/1000000;
+    }
+    return snprintf(out,cap,"vs st=%llu rf=%llu re=%u wants=%u age=%llums",(unsigned long long)vsyncEvents[4],
+        (unsigned long long)vsyncEvents[5],rearms,wants,(unsigned long long)age);
+}
 void native_legacy_swap_validation_observed(bool accepted,unsigned reason,const void *request,const void *surface) {
     if(accepted)native_legacy_swap_stage(0);
     if(accepted)native_legacy_swap_accepted_count=native_legacy_swap_accepted_count+1;
@@ -279,7 +302,14 @@ __attribute__((noinline)) void native_legacy_transfer_observed(IOReturn status,c
         boot_progress_stage(message);
     }
 }
+// The display's offer of one frame is the only place the compositor's surface memory is visible every frame: MdssProbe.cpp
+// counts the distinct descriptors and how many physically contiguous segments each has (the zero-copy plan's U5), and
+// FlipProbe.cpp counts the frames until it knows the panel is really being scanned by this kernel before it writes anything.
+extern void native_mdss_surface_offered(IOMemoryDescriptor *);
+extern void native_flip_frame_offered(void);
 bool native_legacy_gpu_offer(void *display,IOMemoryDescriptor *memory,uint64_t stride,uint32_t width,uint32_t height) {
+    native_mdss_surface_offered(memory);
+    native_flip_frame_offered();
     return gpuHandoffPresenter && native_gop_gpu_offer(gpuHandoffPresenter,display,memory,stride,width,height);
 }
 void native_legacy_gpu_fallback_observed(int status) {
@@ -510,17 +540,31 @@ extern void native_hid_input_probe(void);
 extern void native_keystore_probe(void);
 extern void native_touch_probe(void);
 extern void native_buttons_probe(void);
+extern void native_gestures_probe(void);
+extern void native_battery_probe(void);
 extern void native_gpu_probe(void);
+// The zero-copy plan's P0 map (MdssProbe.cpp): the apps SMMU's display streams, PE_Video, the published frame buffer
+// addresses and the compositor's surface count. It reads no display controller register (an SError from that block panicked
+// the kernel; the file records it), and it needs no boot argument.
+extern void native_mdss_probe(void);
+// P1a of the same plan (FlipProbe.cpp): writes the two planes' scanout address and stride back unchanged, once, after 30
+// offered frames; `pipa-flip=0` turns it off, the default runs it.
+extern void native_flip_probe(void);
 // pipa: the key store stand-in, the HID input, the touch controller (TouchProbe.cpp, Novatek NT36532, pipa-touch=<stage>), the
-// keys (Buttons.c, pipa-buttons=1) and the Adreno 650 power bring-up (GpuProbe.cpp, pipa-gpu=<mode>), all default off. sheng's CPU
-// frequency and GPU power probes and UniXNU-tb128fu's GPU and USB log probes drive other hardware and are not in this board's
-// archive.
+// keys (Buttons.c, pipa-buttons=1), the scripted touches (Gestures.c, pipa-gesture=<seconds>), the battery (NativeBattery.cpp,
+// pipa-battery=<0|1|2>; the only one on by default) and the Adreno 650 power bring-up (GpuProbe.cpp, pipa-gpu=<mode>), the rest
+// default off. sheng's CPU frequency and GPU power probes and UniXNU-tb128fu's GPU and USB log probes drive other hardware and
+// are not in this board's archive.
 void native_legacy_display_late_probe(void) {
     native_keystore_probe();
     native_hid_input_probe();
     native_touch_probe();
     native_buttons_probe();
+    native_gestures_probe();
+    native_battery_probe();
     native_gpu_probe();
+    native_mdss_probe();
+    native_flip_probe();
     IOService *display=pendingLegacyDisplay;if(!display)return;pendingLegacyDisplay=nullptr;
     native_legacy_surface_status=OSKextLoadKextWithIdentifier("com.apple.iokit.IOSurface");
     OSDictionary *matching=IOService::nameMatching("IOCoreSurfaceRoot");

@@ -87,8 +87,26 @@ static void buttons_thread(void *parameter, int wait_result) {
     if (rc) {native_buttons_error = -5; return;}
     struct buttons_debounce d = {0, 0, 0};
     uint32_t errors = 0;
+    // pipa-power-at=<seconds>: one synthesized power press this long after the probe starts, through the same sink the real key uses,
+    // so a round can leave the tablet with the display off (iPadOS locks on a power press) instead of burning the panel.
+    unsigned powerAt = 0;
+    PE_parse_boot_argn("pipa-power-at", &powerAt, sizeof powerAt);
+    uint32_t ticks = 0;
+    unsigned powerSent = 0;
     for (;;) {
         IOSleep(POLL_MS);
+        if (powerAt && !powerSent && ++ticks >= powerAt * (1000u / POLL_MS)) {
+            powerSent = 1;
+            void (*cb)(void *, uint32_t) = __atomic_load_n(&sink, __ATOMIC_ACQUIRE);
+            void *ctx = __atomic_load_n(&sink_context, __ATOMIC_ACQUIRE);
+            if (cb) {
+                cb(ctx, BTN_POWER);
+                IOSleep(150);
+                cb(ctx, 0);
+            }
+            snprintf(native_buttons_row, sizeof native_buttons_row, "power press at %u s%s", powerAt, cb ? "" : " (no sink)");
+            native_buttons_changes = native_buttons_changes + 1;
+        }
         if (read8(pon, BTN_RT_STS, &pon_sts) || read8(gpio, BTN_RT_STS, &gpio_sts)) {++errors; continue;}
         if (!buttons_debounce_step(&d, buttons_mask(pon_sts, gpio_sts), 2)) continue;
         native_buttons_mask = d.stable;

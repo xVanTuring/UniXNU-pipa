@@ -101,7 +101,7 @@ extern volatile uint32_t native_adreno_pool_stats[8];
 // 29 the UCHE and UBWC registers as read back.
 enum {kRowSummary, kRowGcc, kRowGpucc, kRowSmmu, kRowClk, kRowClk2, kRowGmu, kRowGmu2, kRowDbArc, kRowDbBcm, kRowLevels,
       kRowContext = kRowLevels + 3, kRowLoad, kRowHfi, kRowAfter, kRowGx, kRowGpuCtx, kRowCp, kRowCpState, kRowZap, kRowIrq,
-      kRowPublish, kRowMetal, kRowLive, kRowHang, kRowHang2, kRowFaults, kRowUche, kRows};
+      kRowPublish, kRowMetal, kRowLive, kRowHang, kRowHang2, kRowFaults, kRowUche, kRowTiling, kRows};
 extern "C" {
 char native_gpu_rows[kRows][120];
 volatile uint32_t native_gpu_changes;
@@ -603,6 +603,22 @@ void ucheRow() {
              gpuRead(0xB604), gpuRead(0xAE02), gpuRead(0x534));
     if (strncmp(line, native_gpu_rows[kRowUche], sizeof line)) {
         strlcpy(native_gpu_rows[kRowUche], line, sizeof native_gpu_rows[0]);
+        changed();
+    }
+}
+
+// The tiling the last render pass left in the GPU (read every 2 s while the UI runs): GRAS_SC_BIN_CNTL and RB_CNTL carry the bin size in
+// pixels (BINW = width / 32, BINH = height / 16) and where the bin buffers live, VSC_BIN_SIZE the tiler's, RB_CCU_CACHE_CNTL the CCU
+// cache offsets and sizes, and RB_MRT_0_INFO/BASE the first colour target. Decoded, because GMEM passes put 4-row slices of the frame in
+// the wrong place (2026-10-24) and the bin size says which tiling the hardware was actually asked to render.
+void tilingRow() {
+    const uint32_t rb = gpuRead(0x8800), gras = gpuRead(0x80A1), vsc = gpuRead(0x0C02);
+    char line[sizeof native_gpu_rows[0]];
+    snprintf(line, sizeof line, "TILE bin %ux%u rb %08x gras %08x vsc %ux%u | mrt0 %08x %08x%08x vrs %08x",
+             (gras & 0x3f) * 32, ((gras >> 8) & 0x7f) * 16, rb, gras, (vsc & 0xff) * 32, ((vsc >> 8) & 0x1ff) * 16,
+             gpuRead(0x8822), gpuRead(0x8824), gpuRead(0x8823), gpuRead(0x88F4));
+    if (strncmp(line, native_gpu_rows[kRowTiling], sizeof line)) {
+        strlcpy(native_gpu_rows[kRowTiling], line, sizeof native_gpu_rows[0]);
         changed();
     }
 }
@@ -1188,6 +1204,7 @@ void hangRows(unsigned t) {
             changed();
         }
         ucheRow();
+        tilingRow();
         static bool oobDumped;
         if (!oobDumped && (gIrqSeen & (1u << 24))) {oobDumped = true; regDump("oob");}   // RBBM_INT_0 UCHE_OOB_ACCESS
         IOSleep(2000);

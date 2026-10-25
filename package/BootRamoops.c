@@ -56,6 +56,21 @@ typedef unsigned char u8;
 #define PON_SOFT_RB_SPARE     0x8F
 #define PON_RESET_EN          0x80
 #define PON_REASON_BOOTLOADER (2 << 1)        // SOFT_RB_SPARE bits 7:1
+// The PON block's PMIC watchdog (mainline pm8916_wdt.c): S1 counts down from the last pet and barks, S2 then resets the PMIC
+// (and with it the SoC through PS_HOLD) after its own delay. S2_CTL holds the reset type (0x01 warm, 0x04 shutdown, 0x07 hard),
+// S2_CTL2 bit 7 arms the stage-2 reset, PET bit 0 pets. PON_INT_RT_STS bit 6 is the bark, POFF_REASON1 bit 2 says a PMIC
+// watchdog caused the last power off.
+#define PON_WD_S1_TIMER       0x54
+#define PON_WD_S2_TIMER       0x55
+#define PON_WD_S2_CTL         0x56
+#define PON_WD_S2_CTL2        0x57
+#define PON_WD_PET            0x58
+#define PON_WD_S2_EN          0x80
+#define PON_WD_PET_BIT        0x01
+#define PON_WD_RESET_WARM     0x01
+#define PON_RT_STS            0x10
+#define PON_POFF_REASON1      0x0C
+#define PON_POFF_REASON2      0x0D
 #define PS_HOLD               0x0C264000UL    // restart@c264000
 #define IMEM_RESTART_REASON   0x146BF65CUL    // qcom,msm-imem-restart_reason
 #define RESTART_BOOTLOADER    0x77665500U
@@ -231,6 +246,7 @@ static void cpufreq(int request) {
 }
 
 // One byte of a PMIC peripheral through the SPMI arbiter (RamoopsLogLib's SpmiRead8/SpmiWrite8). 0 = done.
+static volatile u32 *ponObserver, *ponChannel;   // the PON's observer and channel windows, resolved by prepare_warm_fastboot
 static int spmi_wait(volatile u32 *channel) {
   for (u32 poll = 0; poll < SPMI_POLLS; ++poll) {
     u32 status = channel[SPMI_STATUS / 4];
@@ -285,6 +301,8 @@ static u32 prepare_warm_fastboot(void) {
   volatile u32 *channel = (volatile u32 *)ml_io_map(SPMI_CHNLS + SPMI_CHNL_APID_STRIDE * (u64)apid, 0x1000);
   if (!observer_page || !channel) return 0x02;
   volatile u32 *observer = (volatile u32 *)(observer_page + (observer_phys & 0xFFF));
+  ponObserver = observer;   // the watchdog thread uses the same two windows
+  ponChannel = channel;
   u8 type = 0, subtype = 0;
   if (spmi_read8(observer, 0x04, &type) || spmi_read8(observer, 0x05, &subtype)) return 0x20;
   if (type != 0x01 || (subtype != 0x04 && subtype != 0x05)) return 0x21;
@@ -293,6 +311,150 @@ static u32 prepare_warm_fastboot(void) {
   if (spmi_warm_reset(observer, channel, PON_KPDPWR_S2_CTL)) return 0x41;
   if (spmi_warm_reset(observer, channel, PON_COMBO_S2_CTL)) return 0x42;
   return 0;
+}
+
+// ---- The PON's own watchdog: the last resort when the kernel stops running.
+// A wedged interconnect or a dead CPU leaves nothing inside the kernel able to restart the tablet, but the PMIC keeps its own
+// timer over SPMI (a separate two-wire bus) and pulls PS_HOLD itself. 60 s without a pet is the bite; a thread pets it every
+// 2 s. The warm reset type and the bootloader's fastboot reason (SOFT_RB_SPARE) are already written by prepare_warm_fastboot,
+// and a warm reset keeps DRAM, so the next boot comes up in fastboot with this ring intact.
+// `pipa-wd=0` turns it off (14 bytes on the command line); `pipa-wd=2` or `pipa-wd=test` arms it and stops feeding after 15 s,
+// which is how one round can watch the reset actually happen. Default (no argument) is armed and fed.
+#define WD_BITE_SECONDS 60
+#define WD_FEED_MS      2000
+#define WD_TEST_MS      15000
+#define WD_LOG_EVERY    150                     // one "feed N ok" every 5 minutes, not every 2 s
+
+static int spmi_write8(volatile u32 *channel, u8 address, u8 value) {
+  if (!channel) return 1;
+  channel[SPMI_WDATA0 / 4] = value;
+  channel[SPMI_CMD / 4] = (u32)address << 4;
+  return spmi_wait(channel);
+}
+static int wd_read(u8 address, u8 *value) {
+  return !ponObserver || spmi_read8(ponObserver, address, value);
+}
+// Write a masked byte, then read the register back: 0 only when the peripheral holds what was written.
+static int wd_write_checked(u8 address, u8 mask, u8 value) {
+  if (!ponObserver || !ponChannel) return 1;
+  if (spmi_update8(ponObserver, ponChannel, address, mask, value)) return 2;
+  u8 readback = 0;
+  if (spmi_read8(ponObserver, address, &readback)) return 3;
+  return (readback & mask) == (value & mask) ? 0 : 4;
+}
+// 0 = armed; otherwise the step that failed, and the log carries the code.
+static u32 wd_arm(void) {
+  if (wd_write_checked(PON_WD_S1_TIMER, 0xFF, WD_BITE_SECONDS)) return 0x10;
+  if (wd_write_checked(PON_WD_S2_TIMER, 0xFF, 0)) return 0x11;
+  if (wd_write_checked(PON_WD_S2_CTL, 0x0F, PON_WD_RESET_WARM)) return 0x12;
+  if (wd_write_checked(PON_WD_S2_CTL2, PON_WD_S2_EN, PON_WD_S2_EN)) return 0x13;
+  return 0;
+}
+// The pet is write-only in practice (it reads back as a self-clearing bit), so the SPMI transaction's own status is the health
+// signal here; the S2 enable bit is re-read every 30 s below.
+static int wd_feed(void) {return spmi_write8(ponChannel, PON_WD_PET, PON_WD_PET_BIT);}
+// On a failed arm, put back what was there: the bootloader may have left a watchdog armed, and taking it away without arming
+// ours would leave the tablet with none.
+static void wd_restore(u8 s1, u8 s2, u8 type, u8 cntl) {
+  wd_write_checked(PON_WD_S1_TIMER, 0xFF, s1);
+  wd_write_checked(PON_WD_S2_TIMER, 0xFF, s2);
+  wd_write_checked(PON_WD_S2_CTL, 0x0F, type & 0x0F);
+  if (cntl & PON_WD_S2_EN) wd_write_checked(PON_WD_S2_CTL2, PON_WD_S2_EN, PON_WD_S2_EN);
+}
+
+static void watchdog_thread(void *argument, int result) {
+  (void)result;
+  const unsigned mode = (unsigned)(unsigned long)argument;   // 1 = fed, 2 = fed for 15 s then left to bite
+  char text[96];
+  u8 s1 = 0, s2 = 0, type = 0, cntl = 0, sts = 0, spare = 0, poff1 = 0, poff2 = 0;
+  if (wd_read(PON_WD_S1_TIMER, &s1) || wd_read(PON_WD_S2_TIMER, &s2) || wd_read(PON_WD_S2_CTL, &type) ||
+      wd_read(PON_WD_S2_CTL2, &cntl) || wd_read(PON_RT_STS, &sts) || wd_read(PON_SOFT_RB_SPARE, &spare) ||
+      wd_read(PON_POFF_REASON1, &poff1) || wd_read(PON_POFF_REASON2, &poff2)) {
+    line("wd: ", "not armed (the PON does not answer over SPMI)");
+    return;
+  }
+  snprintf(text, sizeof text, "pon s1 %02x s2 %02x type %02x cntl %02x sts %02x", s1, s2, type, cntl, sts);
+  line("wd: ", text);
+  snprintf(text, sizeof text, "pon spare %02x poff %02x/%02x, armed by %s", spare, poff1, poff2,
+           (cntl & PON_WD_S2_EN) ? "the bootloader" : "nobody");
+  line("wd: ", text);
+  // Whoever had it armed, it is ours now: stop it while the timers change, then arm with our values. Nothing can bite in
+  // between, because the stage-2 reset stays off until the last write.
+  if ((cntl & PON_WD_S2_EN) && wd_write_checked(PON_WD_S2_CTL2, PON_WD_S2_EN, 0)) {
+    line("wd: ", "not armed (the bootloader's timer does not let go)");
+    return;
+  }
+  const u32 failure = wd_arm();
+  if (failure) {
+    snprintf(text, sizeof text, "not armed (arm step 0x%02x)", (unsigned)failure);
+    line("wd: ", text);
+    wd_restore(s1, s2, type, cntl);
+    return;
+  }
+  // One pet before the thread settles in; if the write cannot be made, take the arming back rather than leave a timer that
+  // nothing is feeding.
+  int pet = wd_feed();
+  for (unsigned retry = 0; pet && retry < 5; ++retry) {
+    IOSleep(200);
+    pet = wd_feed();
+  }
+  if (pet) {
+    wd_write_checked(PON_WD_S2_CTL2, PON_WD_S2_EN, 0);
+    line("wd: ", "not armed (the pet does not go through; disarmed)");
+    return;
+  }
+  snprintf(text, sizeof text, "armed %u s, feeding every %u s%s", WD_BITE_SECONDS, WD_FEED_MS / 1000,
+           mode == 2 ? ", test mode" : "");
+  line("wd: ", text);
+  unsigned feeds = 0, failing = 0;
+  for (;;) {
+    IOSleep(WD_FEED_MS);
+    if (mode == 2 && (feeds + 1) * WD_FEED_MS >= WD_TEST_MS) {
+      line("wd: ", "test mode, stopping the feed at 15 s");
+      return;   // no more pets: the PMIC resets the tablet 60 s after the last one
+    }
+    ++feeds;
+    const int rc = wd_feed();
+    if (rc) {
+      if (!failing) {snprintf(text, sizeof text, "feed %u failed (spmi %d), retrying", feeds, rc); line("wd: ", text);}
+      if (++failing == 10) line("wd: ", "10 feeds failed; the PMIC will reset the tablet");
+      continue;
+    }
+    if (failing) {
+      snprintf(text, sizeof text, "feed %u ok again after %u failures", feeds, failing);
+      line("wd: ", text);
+      failing = 0;
+    } else if (feeds == 1 || feeds % WD_LOG_EVERY == 0) {
+      snprintf(text, sizeof text, "feed %u ok", feeds);
+      line("wd: ", text);
+    }
+    if (feeds % 15 == 0) {   // still armed? (the bootloader, a reset of the PMIC block, or someone else may have cleared it)
+      u8 now = 0;
+      if (!spmi_read8(ponObserver, PON_WD_S2_CTL2, &now) && !(now & PON_WD_S2_EN)) {
+        line("wd: ", "found it disarmed, arming again");
+        if (wd_arm()) line("wd: ", "re-arm failed");
+      }
+    }
+  }
+}
+// Started from boot_progress_start, before anything slow: a boot that takes ten minutes must not look like a hang, and the
+// feeder has to be running before the first 60 s can expire.
+static void watchdog_start(void) {
+  unsigned mode = 1;
+  char argument[16] = {0};
+  if (PE_parse_boot_argn("pipa-wd", argument, sizeof argument)) {
+    const unsigned numeric = (unsigned)(u8)argument[0] | ((unsigned)(u8)argument[1] << 8) |
+                             ((unsigned)(u8)argument[2] << 16) | ((unsigned)(u8)argument[3] << 24);
+    if (!numeric) mode = 0;
+    else if (numeric == 2 || !__builtin_strncmp(argument, "test", 4)) mode = 2;
+  }
+  if (!mode) {line("wd: ", "off (pipa-wd=0)"); return;}
+  void *thread = 0;
+  if (kernel_thread_start(watchdog_thread, (void *)(unsigned long)mode, &thread) != 0) {
+    line("wd: ", "not armed (no thread)");
+    return;
+  }
+  thread_deallocate(thread);
 }
 
 static u64 smc3(u64 function, u64 a1, u64 a2, u64 a3) {
@@ -335,6 +497,11 @@ extern volatile u32 native_legacy_unit_scale_calls __attribute__((weak_import));
 extern volatile u32 native_legacy_chosen_scale __attribute__((weak_import));
 extern volatile u32 native_legacy_chosen_rotation __attribute__((weak_import));
 extern unsigned native_legacy_swap_pacing(char *out, unsigned cap) __attribute__((weak_import));
+// The scanout hand-off's retry record and the refresh tick's state as two short lines, and the tick's watchdog (NativeLegacyDisplay.cpp
+// native_legacy_vsync_kick: arms a tick again that stopped while a client waits; cheap while ticks arrive).
+extern unsigned native_legacy_prepare_brief(char *out, unsigned cap) __attribute__((weak_import));
+extern unsigned native_legacy_vsync_brief(char *out, unsigned cap) __attribute__((weak_import));
+extern int native_legacy_vsync_kick(void) __attribute__((weak_import));
 // The cores (drivers/ArmCpu): each logical core's start step (7 = running), the cores running, IPIs sent and taken, and the
 // SPI block standing in for SGIs.
 extern volatile u32 armcpu_smp_step[8] __attribute__((weak_import));
@@ -406,10 +573,50 @@ static void buttons_status(void) {
   logged = changes;
   touch_row("buttons: ", native_buttons_row, sizeof native_buttons_row);
 }
+// The battery (NativeBattery.cpp, pipa-battery=<0|1|2>): its row after every change of the reading (at most one per pass),
+// and the state at which the driver stopped when it could not publish (the object itself is an IOPMPowerSource in the registry).
+extern char native_battery_row[120] __attribute__((weak_import));
+extern volatile unsigned native_battery_changes __attribute__((weak_import));
+extern volatile int native_battery_error __attribute__((weak_import));
+extern volatile unsigned native_battery_published __attribute__((weak_import));
+static void battery_status(void) {
+  static unsigned logged, error_logged, published_logged;
+  if (!&native_battery_row || !&native_battery_changes || !&native_battery_error || !&native_battery_published) return;
+  if (native_battery_published && !published_logged) {line("battery: ", "IOPMPowerSource published"); published_logged = 1;}
+  if (native_battery_error && !error_logged) {
+    char text[48];
+    snprintf(text, sizeof text, "%s, error %d", native_battery_published ? "read failed" : "stopped", native_battery_error);
+    line("battery: ", text);
+    error_logged = 1;
+  }
+  unsigned changes = native_battery_changes;
+  if (changes == logged) return;
+  logged = changes;
+  touch_row("battery: ", native_battery_row, sizeof native_battery_row);
+}
+// The scripted touches (Gestures.c, pipa-gesture=<seconds>): one row per step in a ring of eight, each printed once, and the
+// error at which the script gave up. A step's row carries the HID reports it caused (the event reached the event driver) and the
+// presented frames (the UI reacted).
+extern char native_gesture_rows[8][120] __attribute__((weak_import));
+extern volatile unsigned native_gesture_written __attribute__((weak_import));
+extern volatile int native_gesture_error __attribute__((weak_import));
+static void gesture_status(void) {
+  static unsigned logged, error_logged;
+  if (!&native_gesture_rows || !&native_gesture_written || !&native_gesture_error) return;
+  if (native_gesture_error && !error_logged) {
+    char text[48];
+    snprintf(text, sizeof text, "error %d", native_gesture_error);
+    line("gesture: ", text);
+    error_logged = 1;
+  }
+  unsigned written = native_gesture_written;
+  if (written - logged > 8) logged = written - 8;
+  for (; logged < written; ++logged) touch_row("gesture: ", native_gesture_rows[logged & 7], sizeof native_gesture_rows[0]);
+}
 // The GPU bring-up (GpuProbe.cpp, pipa-gpu=<mode>): each row whose text changed, and its step every 10 s while it runs (a hang
 // in a register read leaves the step it was at). Once the device is published its live row changes every few seconds; only that
 // row is written then.
-extern char native_gpu_rows[30][120] __attribute__((weak_import));
+extern char native_gpu_rows[31][120] __attribute__((weak_import));
 extern volatile unsigned native_gpu_changes __attribute__((weak_import));
 extern volatile unsigned native_gpu_step __attribute__((weak_import));
 static void gpu_status(int periodic) {
@@ -423,11 +630,58 @@ static void gpu_status(int periodic) {
   unsigned changes = native_gpu_changes;
   if (changes == logged) return;
   logged = changes;
-  static char last[30][120];
-  for (unsigned i = 0; i < 30; ++i) {
+  static char last[31][120];
+  for (unsigned i = 0; i < 31; ++i) {
     if (!strncmp(last[i], native_gpu_rows[i], sizeof last[i])) continue;
     strlcpy(last[i], native_gpu_rows[i], sizeof last[i]);
     touch_row("gpu: ", last[i], sizeof last[i]);
+  }
+}
+
+// The zero-copy plan's P0 map (MdssProbe.cpp): the apps SMMU's display streams, the frame buffer and the compositor's
+// surfaces, with no display controller register read (an SError from that block panicked the kernel; the file says why).
+// Each row whose text changed, and its step every 10 s while it starts, so a read that hangs still leaves the step it was at.
+extern char native_mdss_rows[31][120] __attribute__((weak_import));
+extern volatile unsigned native_mdss_changes __attribute__((weak_import));
+extern volatile unsigned native_mdss_step __attribute__((weak_import));
+static void mdss_status(int periodic) {
+  static unsigned logged;
+  if (!&native_mdss_rows || !&native_mdss_changes || !&native_mdss_step || !native_mdss_step) return;
+  if (periodic && native_mdss_step != 99) {
+    char text[32];
+    snprintf(text, sizeof text, "step %u", native_mdss_step);
+    line("mdss: ", text);
+  }
+  unsigned changes = native_mdss_changes;
+  if (changes == logged) return;
+  logged = changes;
+  static char last[31][120];
+  for (unsigned i = 0; i < 31; ++i) {
+    if (!native_mdss_rows[i][0]) continue;
+    if (!strncmp(last[i], native_mdss_rows[i], sizeof last[i])) continue;
+    strlcpy(last[i], native_mdss_rows[i], sizeof last[i]);
+    touch_row("mdss: ", last[i], sizeof last[i]);
+  }
+}
+
+// P1 of the same plan (FlipProbe.cpp): the two planes' address and stride written back unchanged (P1a), red and green in our
+// own 7424-stride buffers and back (P1b), and the SMMU gate that gives the display's stream our own translation with an
+// identity map of the frame buffer and enables it (P1c). One row per event, one progress row for the gate's steps, plus the
+// watchdog if it had to step in.
+extern char native_flip_rows[16][120] __attribute__((weak_import));
+extern volatile unsigned native_flip_changes __attribute__((weak_import));
+static void flip_status(void) {
+  static unsigned logged;
+  if (!&native_flip_rows || !&native_flip_changes) return;
+  unsigned changes = native_flip_changes;
+  if (changes == logged) return;
+  logged = changes;
+  static char last[16][120];
+  for (unsigned i = 0; i < 16; ++i) {
+    if (!native_flip_rows[i][0]) continue;
+    if (!strncmp(last[i], native_flip_rows[i], sizeof last[i])) continue;
+    strlcpy(last[i], native_flip_rows[i], sizeof last[i]);
+    touch_row("flip: ", last[i], sizeof last[i]);
   }
 }
 
@@ -447,6 +701,9 @@ extern struct native_adreno_metal_diag_view native_adreno_metal_diag __attribute
 struct native_adreno_open_record {char name[20]; u32 type, macf, res, attach, foreign;};
 extern struct native_adreno_open_record native_adreno_open_log[8] __attribute__((weak_import));
 extern volatile u32 native_adreno_open_log_count __attribute__((weak_import));
+// Processes that read MetalPluginName (NativeAdrenoPublish.cpp native_adreno_metal_askers), in the order they first asked.
+struct native_adreno_asker_record {char name[20]; u32 reads;};
+extern struct native_adreno_asker_record native_adreno_metal_askers[12] __attribute__((weak_import));
 extern volatile int native_gpu_addon_files __attribute__((weak_import)), native_gpu_addon_written __attribute__((weak_import)),
     native_gpu_addon_same __attribute__((weak_import)), native_gpu_addon_failed __attribute__((weak_import)),
     native_gpu_addon_error __attribute__((weak_import));
@@ -483,13 +740,27 @@ static void gpu_stack_status(void) {
   if (&native_adreno_metal_diag) {
     const struct native_adreno_metal_diag_view *d = &native_adreno_metal_diag;
     const unsigned total = d->marks_total, shown = total < 8 ? total : 8;
-    unsigned used = (unsigned)snprintf(row, sizeof row, "plugin opens=%u busy=%u bad=%u closes=%u names=%u foreign=%u/%x starter=%.16s marks=%u:",
+    unsigned used = (unsigned)snprintf(row, sizeof row, "plugin opens=%u busy=%u bad=%u closes=%u namereads=%u foreign=%u/%x starter=%.16s marks=%u:",
                                        d->opens, d->busy, d->bad, d->closes, d->name_reads, d->foreign_opens, d->foreign_type, d->starter[0], total);
     for (unsigned i = 0; i < shown && used < sizeof row; ++i)
       used += (unsigned)snprintf(row + used, sizeof row - used, " %x", d->marks[(total - shown + i) & 15]);
     stack_row(1, row);
     snprintf(row, sizeof row, "plugin report %.63s | %.63s", d->report, d->report2);
     stack_row(2, row);
+  }
+  // Who reads MetalPluginName (NativeAdrenoPublish.cpp native_adreno_metal_askers): the plugin row's namereads= counts the reads, this
+  // names the processes behind them and each one's count, so "3 reads" cannot be read as "3 processes".
+  if (&native_adreno_metal_askers) {
+    unsigned count = 0;
+    for (unsigned i = 0; i < 12 && native_adreno_metal_askers[i].name[0]; ++i) ++count;
+    if (count) {
+      unsigned used = (unsigned)snprintf(row, sizeof row, "MetalPluginName askers procs=%u:", count);
+      for (unsigned i = 0; i < count && i < 6 && used + 26 < sizeof row; ++i)
+        used += (unsigned)snprintf(row + used, sizeof row - used, " %.19s %u", native_adreno_metal_askers[i].name,
+                                   native_adreno_metal_askers[i].reads);
+      if (count > 6 && used + 8 < sizeof row) snprintf(row + used, sizeof row - used, " +%u", count - 6);
+      stack_row(7, row);
+    }
   }
   if (&native_adreno_client_log) {
     unsigned used = (unsigned)snprintf(row, sizeof row, "clients");
@@ -624,17 +895,56 @@ static void framebuffer_status(void) {
   }
 }
 
-// Two 64 x 64 pixel crops of the frame buffer at full resolution, one character per pixel (the same luma ramp): where the home screen's
-// first widget (first page) and first folder (second page) have their top-left corner. The user saw every rounded corner of the
-// Metal-rendered UI drawn wrong (2026-10-24).
+// Two 64 x 64 pixel crops of the frame buffer at full resolution, one character per pixel (the same luma ramp): the home screen's first
+// widget's top-left corner, and a run of the dock's label text. The user saw every rounded corner of the Metal-rendered UI drawn wrong
+// (2026-10-24); the text says whether the whole frame shifts in 4-row slices or only the corner's shape does.
+static const char kLumaRamp[] = " .:-=+*#%@";
+
+static char lumaChar(volatile const u32 *fb, u32 width, u32 x, u32 y) {
+  const u32 pixel = fb[(u64)y * width + x];
+  const u32 luma = (((pixel >> 16) & 0xff) * 77 + ((pixel >> 8) & 0xff) * 150 + (pixel & 0xff) * 29) >> 8;
+  return kLumaRamp[luma * 10 / 256];
+}
+
+static void framebuffer_picture(volatile const u32 *fb, u32 width, u32 height, u32 x0, u32 y0, u32 step) {
+  char head[64];
+  snprintf(head, sizeof head, "%ux%u of %u,%u every %u", 64 * step, 64 * step, x0, y0, step);
+  line("fbcrop: ", head);
+  for (u32 y = 0; y < 64; ++y) {
+    char row[72];
+    for (u32 x = 0; x < 64; ++x) {
+      const u32 px = x0 + x * step < width ? x0 + x * step : width - 1;
+      const u32 py = y0 + y * step < height ? y0 + y * step : height - 1;
+      row[x] = lumaChar(fb, width, px, py);
+    }
+    row[64] = 0;
+    line("fbcrop: ", row);
+  }
+}
+
 static void framebuffer_crops(void) {
   if (!&native_legacy_gop_virtual || !&native_legacy_gop_width || !&native_legacy_gop_height || !&native_legacy_gop_bytes) return;
   const u32 width = native_legacy_gop_width, height = native_legacy_gop_height;
   volatile const u32 *fb = (volatile const u32 *)native_legacy_gop_virtual;
   if (!fb || width < 256 || height < 1024 || native_legacy_gop_bytes < (u64)width * 4 * height) return;
   static const char ramp[] = " .:-=+*#%@";
-  static const u32 origin[2][2] = {{176, 136}, {176, 936}};
+  // The first widget's top-left corner (first page) and a run of the dock's label text (a glyph's edge tells a whole-frame 4-row
+  // shift from one that only the corner's shape suffers).
+  // The first widget's corner, found rather than fixed: the first row below the status bar with a long bright run is the platter's top
+  // edge, so the crop follows the layout (2026-10-25: a fixed origin missed it after the UI moved by a few dozen pixels).
+  u32 located[2] = {176, 136};
+  for (u32 y = 120; y + 8 < height && located[1] == 136; ++y) {
+    for (u32 x = 96; x + 40 < width; ++x) {
+      u32 run = 0;
+      while (run < 40 && lumaChar(fb, width, x + run, y) == '@') ++run;
+      if (run == 40) {located[0] = x > 40 ? x - 40 : 0; located[1] = y > 40 ? y - 40 : 0; break;}
+    }
+    if (y > 900) break;
+  }
+  const u32 origin[2][2] = {{located[0], located[1]}, {560, 2740}};
   for (u32 c = 0; c < 2; ++c) {
+    // The same corner with 256 x 256 pixels of its surroundings, four pixels per character, to see what the detail crop is a part of.
+    if (c == 0) framebuffer_picture(fb, width, height, origin[c][0] - 80, origin[c][1] - 56, 4);
     char head[48];
     snprintf(head, sizeof head, "%ux%u at %u,%u", 64, 64, origin[c][0], origin[c][1]);
     line("fbcrop: ", head);
@@ -648,11 +958,69 @@ static void framebuffer_crops(void) {
       row[64] = 0;
       line("fbcrop: ", row);
     }
+    // The crop's first lit column per row (two hex digits, 255 = none) and how many pixels differ from the row above (one hex digit, '.' for
+    // none): a shape whose columns and rows repeat in groups of four is the 4 x 4 granularity of the GMEM path showing through, where the
+    // plain picture alone cannot tell a coarse edge from a scrambled one.
+    char edges[144], deltas[80];
+    for (u32 y = 0; y < 64; ++y) {
+      u32 edge = 255, diff = 0;
+      for (u32 x = 0; x < 64; ++x) {
+        const u32 pixel = fb[(u64)(origin[c][1] + y) * width + origin[c][0] + x];
+        const u32 luma = (((pixel >> 16) & 0xff) * 77 + ((pixel >> 8) & 0xff) * 150 + (pixel & 0xff) * 29) >> 8;
+        if (edge == 255 && luma >= 160) edge = x;
+        if (y) {
+          const u32 above = fb[(u64)(origin[c][1] + y - 1) * width + origin[c][0] + x];
+          if (above != pixel) ++diff;
+        }
+      }
+      snprintf(edges + y * 2, 4, "%02x", edge);
+      deltas[y] = y == 0 ? '.' : (diff == 0 ? '.' : "123456789abcdef"[(diff > 15 ? 15 : diff) - 1]);
+    }
+    edges[128] = 0;
+    deltas[64] = 0;
+    line("fbcrop: edge ", edges);
+    line("fbcrop: diff ", deltas);
+    // The same pixels read again a moment later: a count that is not zero means the frame buffer was being written while it was read (the
+    // GPU's copy of the next frame), so the crop is a tear and not what the panel showed.
+    static u32 snapshot[64 * 64];
+    for (u32 y = 0; y < 64; ++y)
+      for (u32 x = 0; x < 64; ++x) snapshot[y * 64 + x] = fb[(u64)(origin[c][1] + y) * width + origin[c][0] + x];
+    u32 moved = 0;
+    for (u32 y = 0; y < 64; ++y)
+      for (u32 x = 0; x < 64; ++x)
+        if (snapshot[y * 64 + x] != fb[(u64)(origin[c][1] + y) * width + origin[c][0] + x]) ++moved;
+    char again[64];
+    snprintf(again, sizeof again, "%u pixels differ from a second read", moved);
+    line("fbcrop: reread ", again);
+    // The first crop's luma as two hex digits per pixel (64 rows of 128 characters): a round with GMEM and one without hold the same
+    // screen, so the two dumps tell a permutation of rows from content that was never drawn finer than a block.
+    if (c == 0) {
+      for (u32 y = 0; y < 64; ++y) {
+        char hex[136];
+        for (u32 x = 0; x < 64; ++x) {
+          const u32 pixel = fb[(u64)(origin[c][1] + y) * width + origin[c][0] + x];
+          const u32 luma = ((pixel >> 16) & 0xff) * 77 + ((pixel >> 8) & 0xff) * 150 + (pixel & 0xff) * 29;
+          const char *digits = "0123456789abcdef";
+          hex[x * 2] = digits[(luma >> 12) & 0xf];
+          hex[x * 2 + 1] = digits[(luma >> 8) & 0xf];
+        }
+        hex[128] = 0;
+        line("fbcrop: h ", hex);
+      }
+    }
   }
 }
 
 // The lines sheng's progress page shows for other components (KeyStoreProbe.cpp writes line 0); logged with the display line.
 char boot_progress_ext[8][48];
+
+// One line of the display's own state, written when its text changes (the counters in it move every sample while the UI runs).
+static void display_row(unsigned slot, const char *text) {
+  static char last[2][224];
+  if (slot > 1 || !text[0] || !strncmp(last[slot], text, sizeof last[slot])) return;
+  strlcpy(last[slot], text, sizeof last[slot]);
+  line("display: ", last[slot]);
+}
 
 static void display_status(void) {
   if (!&native_legacy_stage || !&native_legacy_gop_width || !&native_legacy_gop_height || !&native_legacy_swap_validation_calls ||
@@ -667,6 +1035,11 @@ static void display_status(void) {
   line("display: ", text);
   // The frame rate while the UI moves (LegacyDisplayProbe.cpp): swaps less than 200 ms apart, their gaps, submit-to-retire.
   if (&native_legacy_swap_pacing && native_legacy_swap_pacing(text, sizeof text)) line("display: ", text);
+  // The scanout hand-off's retries and whether the refresh tick still runs (LegacyDisplayProbe.cpp): the two facts a round that draws
+  // one or two frames and then nothing is decided by. A tick that stopped shows sent frozen and the age of its last fire growing,
+  // while wants stays 1; an idle stop shows idle counting up instead.
+  if (&native_legacy_prepare_brief && native_legacy_prepare_brief(text, sizeof text)) display_row(0, text);
+  if (&native_legacy_vsync_brief && native_legacy_vsync_brief(text, sizeof text)) display_row(1, text);
   for (unsigned i = 0; i < 8; ++i) {
     if (!boot_progress_ext[i][0]) continue;
     char ext[sizeof boot_progress_ext[i] + 1];
@@ -697,10 +1070,21 @@ static void writer(void *argument, int result) {
     messages();
     panic_text(0);
     if (pass % 100 == 0) {display_status(); cpu_status(); touch_status(); gpu_stack_status(); framebuffer_status(); process_status(0);}
-    if (pass == 2000) {process_status(1); framebuffer_crops();}   // the UI's stacks and two corner crops 200 s after the zone was mapped
+    if (pass == 2000) process_status(1);   // the UI's stacks 200 s after the zone was mapped
+    // Two corner crops every 50 s: a round can end on a panic before the 200 s mark (2026-10-24's unaligned_store round did), and
+    // the crops of a round that turned the pages are the ones worth reading.
+    if (pass % 500 == 0) framebuffer_crops();
     if (pass % 5 == 0) touch_strokes();
     buttons_status();
+    battery_status();
+    gesture_status();
     gpu_status(pass % 100 == 0);
+    mdss_status(pass % 100 == 0);
+    flip_status();
+    // The refresh tick's watchdog (NativeLegacyDisplay.cpp): a tick that stopped while the render server waits for it never comes back
+    // by itself (the family arms it from kickSwapQueue, and a client waiting for a tick submits no swap), so ask every pass. While
+    // ticks arrive this reads two words; when it arms one again the display rows' re= count shows it.
+    if (&native_legacy_vsync_kick) native_legacy_vsync_kick();
     if (restart_after && ticks() - start >= limit) {
       display_status();
       gpu_stack_status();
@@ -714,6 +1098,7 @@ static void writer(void *argument, int result) {
     }
     if (restart_crashes && ui_crashes >= restart_crashes) {
       messages();
+      framebuffer_crops();
       char text[80];
       snprintf(text, sizeof text, "%u SpringBoard/backboardd crashes (pipa-restart-crashes)", ui_crashes);
       line("restart into fastboot: ", text);
@@ -763,6 +1148,7 @@ void boot_progress_start(void) {
   snprintf(text, sizeof text, "PON 0x%x (%s), PS_HOLD %s, after %u s, after a panic %u s", pon, pon ? "not prepared" : "warm, bootloader",
            ps_hold && imem ? "mapped" : "NOT mapped", restart_after, panic_restart_after);
   line("restart into fastboot: ", text);
+  watchdog_start();
   snprintf(text, sizeof text, "about %u MHz (a counted loop against the counter)", cpu_mhz_estimate());
   line("boot cpu: ", text);
   u32 want_cpufreq = 0;

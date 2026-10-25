@@ -294,6 +294,26 @@ gpu_includes=['-I',str(ROOT/'drivers/NativeAdreno'),'-I',str(ROOT/'kits/ArmSmmu4
               '-I',str(ROOT/'kits/AdrenoPM4')]
 run([str(gpu_source) if str(arg)==str(source) else str(gpu_obj) if str(arg)==str(OUT/'LegacyDisplayProbe.o') else arg for arg in cmd]+
     touch_includes+gpu_includes,cwd=r['directory'])
+# The zero-copy plan's P0 map (MdssProbe.cpp): the apps SMMU's display streams, PE_Video, the published frame buffer addresses
+# and the compositor's surfaces. It reads no display controller register (an SError from that block panicked the kernel; the
+# source records it), writes nothing and takes no boot argument.
+mdss_source=ROOT/'kits/pipa/MdssProbe.cpp';mdss_obj=touch_dir/'MdssProbe.o'
+run([str(mdss_source) if str(arg)==str(source) else str(mdss_obj) if str(arg)==str(OUT/'LegacyDisplayProbe.o') else arg for arg in cmd],
+    cwd=r['directory'])
+# The flip and SMMU gate (FlipProbe.cpp): P1a's write-back, P1b's own-buffer flip, and P1c's translation gate, which programs
+# the display's context bank through kits/ArmSmmu4K (`pipa-flip=0` off, the default runs P1b and P1c).
+flip_source=ROOT/'kits/pipa/FlipProbe.cpp';flip_obj=touch_dir/'FlipProbe.o'
+run([str(flip_source) if str(arg)==str(source) else str(flip_obj) if str(arg)==str(OUT/'LegacyDisplayProbe.o') else arg for arg in cmd]+
+    ['-I',str(ROOT/'kits/ArmSmmu4K')],cwd=r['directory'])
+# The battery (kits/pipa/NativeBattery.cpp, an IOPMPowerSource over the PM8150B gauge and SMB5 charger, pipa-battery=<0|1|2>): its
+# class registration is staged late like the other owned services, with the instructions compared before and after.
+battery_source=ROOT/'kits/pipa/NativeBattery.cpp';battery_obj=OUT/'NativeBattery.o';battery_late=OUT/'NativeBattery.late.o'
+run([str(battery_source) if str(arg)==str(source) else str(battery_obj) if str(arg)==str(OUT/'LegacyDisplayProbe.o') else arg for arg in cmd]+
+    ['-I',str(ROOT/'kits/pipa')],cwd=r['directory'])
+run([llvm/'llvm-objcopy','--remove-section=__DATA,__mod_init_func','--globalize-symbol=__GLOBAL__sub_I_NativeBattery.cpp',
+     battery_obj,battery_late])
+require(code(battery_obj.read_bytes(),macho(battery_obj.read_bytes()))==code(battery_late.read_bytes(),macho(battery_late.read_bytes())),
+        'Owned battery instructions unchanged by late init staging')
 gmu_firmware=Path(os.environ.get('PIPA_GMU_FIRMWARE') or ROOT/'.cache/firmware/gpu/a650_gmu.bin')
 require(gmu_firmware.is_file(),f'Missing the GMU firmware {gmu_firmware} (the vendor partition\'s /firmware/a650_gmu.bin)')
 gmu_blob=gmu_firmware.read_bytes()
@@ -343,10 +363,11 @@ def c_compile(c_source,c_obj):
         elif not value.startswith('-W'):out.append(value)
         j+=1
     run(out+['-Wall','-Wextra','-Werror']+touch_includes,cwd=c_record['directory'])
-touch_objs=[probe_obj,gpu_obj]
-# Buttons.c (pipa-buttons=1, the power and volume keys over SPMI for the HID input) goes the same way.
+touch_objs=[probe_obj,gpu_obj,mdss_obj,flip_obj]
+# Buttons.c (pipa-buttons=1, the power and volume keys over SPMI for the HID input) and Gestures.c (pipa-gesture=<seconds>, the
+# scripted touches into the finger set the HID input reports) go the same way.
 for c_source in (ROOT/'drivers/NativeGeniSpi/GeniSpi.c',ROOT/'drivers/NativeNovatekTouch/NvtProtocol.c',firmware_c,ROOT/'kits/pipa/Buttons.c',
-                 gmu_c,sqe_c,zap_c):
+                 ROOT/'kits/pipa/Gestures.c',gmu_c,sqe_c,zap_c):
     c_obj=touch_dir/(c_source.stem+'.o');c_compile(c_source,c_obj);touch_objs.append(c_obj)
 # The display backend, its probe, the key store, the HID input and the touch controller: UniXNU-tb128fu's Himax touch, GPU, RPM and
 # USB log probes, sheng's touch panel (THP), CPU frequency and GPU power objects and QEMU's VirtIO input, shared window and Metal
@@ -367,14 +388,17 @@ run([llvm/'llvm-objcopy','--remove-section=__DATA,__mod_init_func',
 require(code((keyevents/'NativeKeyStoreEvents.o').read_bytes(),macho((keyevents/'NativeKeyStoreEvents.o').read_bytes()))==
         code(keyevents_late.read_bytes(),macho(keyevents_late.read_bytes())),'Owned event-service instructions unchanged by late init staging')
 run(['xcrun','ar','rcs',archive,late,OUT/'original-bindings.o',OUT/'LegacyDisplayProbe.o',keystore_obj,keyevents_late,
-     hid_obj,touch_obj,hid_dir/'NativeHidInput.late.o',hid_dir/'hid-original-bindings.o',*touch_objs])
+     hid_obj,touch_obj,hid_dir/'NativeHidInput.late.o',hid_dir/'hid-original-bindings.o',battery_late,*touch_objs])
 sources=[ROOT/'drivers/NativeMobileDisplay/NativeLegacyDisplay.cpp',ROOT/'drivers/NativeMobileDisplay/NativeLegacyRequest.h',source,
          keystore_source,ROOT/'drivers/NativeKeyStoreEvents/NativeKeyStoreEvents.cpp',hid_source,touch_source,
          ROOT/'drivers/NativeHidInput/NativeHidInput.cpp',ROOT/'scripts/build-native-hid-input.py',probe_source,
          ROOT/'kits/pipa/TouchBoard.h',ROOT/'kits/pipa/SmmuBypass.h',ROOT/'drivers/NativeGeniSpi/GeniSpi.c',
          ROOT/'drivers/NativeGeniSpi/GeniSpi.h',ROOT/'drivers/NativeNovatekTouch/NvtProtocol.c',
          ROOT/'drivers/NativeNovatekTouch/NvtProtocol.h',firmware,ROOT/'kits/pipa/Buttons.c',ROOT/'kits/pipa/ButtonsCore.h',
-         gpu_source,ROOT/'kits/pipa/GpuPowerBoard.h',ROOT/'kits/pipa/A650Gmu.h',gmu_firmware,sqe_firmware,zap_firmware]
+         ROOT/'kits/pipa/Gestures.c',ROOT/'kits/pipa/GesturesCore.h',
+         battery_source,ROOT/'kits/pipa/NativeBatteryBoard.h',
+         gpu_source,ROOT/'kits/pipa/GpuPowerBoard.h',ROOT/'kits/pipa/A650Gmu.h',gmu_firmware,sqe_firmware,zap_firmware,
+         mdss_source,flip_source]
 print(run(['python3',ROOT/'scripts/build-arm-driver.py','NativeGOPPresenter'],text=True),end='')
 gop=ROOT/'build/native-gop-presenter';gop_late=gop/'NativeGOPPresenter.late.o'
 run([llvm/'llvm-objcopy','--remove-section=__DATA,__mod_init_func','--globalize-symbol=__GLOBAL__sub_I_NativeGOPPresenter.cpp',
