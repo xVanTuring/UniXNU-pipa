@@ -1105,6 +1105,18 @@ bool metal() {
     // for a round, e.g. pipa-turnip-debug=sysmem,nocb.
     char turnip[64] = "nocb";
     PE_parse_boot_arg_str("pipa-turnip-debug", turnip, sizeof turnip);
+    // Canned Turnip option sets for a round, so an A/B on the GMEM input attachment bug (HANDOFF-pipa.md 10.14) fits in the
+    // 1000-byte command line: pipa-tu=1..5 (8 bytes) instead of pipa-turnip-debug=<46 bytes>.
+    unsigned canned = 0;
+    if (PE_parse_boot_argn("pipa-tu", &canned, sizeof canned) && canned) {
+        static const char *const sets[] = {"",
+            "pipa_gmemin",                       // 1 GMEM for input attachments, the corner bug on display
+            "pipa_gmemin,pipa_iaflush",          // 2 invalidate the UCHE before every draw that reads GMEM
+            "pipa_gmemin,pipa_iaplain",          // 3 read them through their sysmem descriptor instead
+            "pipa_gmemin,pipa_uchegmem",         // 4 program UCHE_GMEM_RANGE from Turnip itself
+            "pipa_gmemin,pipa_iaflush,pipa_uchegmem"};  // 5 both
+        if (canned < sizeof sets / sizeof sets[0]) snprintf(turnip, sizeof turnip, "%s", sets[canned]);
+    }
     accelerator->setProperty("NativeTurnipDebug", turnip);
     // Device capabilities the Metal frontend withholds in every process (NativeMetalWithhold, as NMB_WITHHOLD): pipa-metal-withhold=
     // apple-families answers no to every Apple GPU family, as UniXNU-tb128fu does (Core Animation blends by framebuffer fetch on an

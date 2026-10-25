@@ -129,9 +129,18 @@ static void gestures_thread(void *parameter, int result) {
     stroke("unlock", GESTURE_UNLOCK_X, GESTURE_UNLOCK_START_Y, GESTURE_UNLOCK_X, GESTURE_UNLOCK_END_Y, 300);
     // 10 s after the unlock: with 5 s the first page turn came too early on some rounds (frame buffers, 2026-10-24).
     wait_ms(10000);
-    stroke("page next", GESTURE_PAGE_FROM_X, GESTURE_PAGE_Y, GESTURE_PAGE_TO_X, GESTURE_PAGE_Y, 300);
-    wait_ms(1500);
-    stroke("page back", GESTURE_PAGE_TO_X, GESTURE_PAGE_Y, GESTURE_PAGE_FROM_X, GESTURE_PAGE_Y, 300);
+    // Three page turns to the left reach the App Library, which is where the frame rate falls apart on the tablet (2026-10-25
+    // evening: 9 to 15 frames a second while its blurred background is on screen, 40 and more elsewhere), then a dwell long enough
+    // for the pacing window to cover it, then the same three turns back.
+    for (unsigned turn = 0; turn < 3; ++turn) {
+        stroke("page next", GESTURE_PAGE_FROM_X, GESTURE_PAGE_Y, GESTURE_PAGE_TO_X, GESTURE_PAGE_Y, 300);
+        wait_ms(1500);
+    }
+    wait_ms(12000);
+    for (unsigned turn = 0; turn < 3; ++turn) {
+        stroke("page back", GESTURE_PAGE_TO_X, GESTURE_PAGE_Y, GESTURE_PAGE_FROM_X, GESTURE_PAGE_Y, 300);
+        wait_ms(1500);
+    }
     wait_ms(3000);
     tap(GESTURE_TAP_X, GESTURE_TAP_Y, 80);
     snprintf(row_slot(), sizeof native_gesture_rows[0], "done at %u s: hid +%u, %u display frames", elapsedMs / 1000,
