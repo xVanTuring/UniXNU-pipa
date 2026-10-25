@@ -638,6 +638,44 @@ static void gesture_status(void) {
 #define AOP_MSG_RAM 0xC300000UL
 #define DDR_STATS_OFFSET_WORD 0xC3F001CUL
 #define DDR_STATS_MAGIC 0xA1157A75U
+// The storage reads so far (NativeUfs.cpp: the root and system windows, one polled request slot, every 4 KiB block hashed): requests,
+// their transport and hash time (generic timer ticks), each 10 s they changed. Settings took seconds to show its content the first time
+// after a boot (2026-10-25): an app's first start reads its frameworks and resources from here.
+extern volatile u64 native_ufs_block_reads __attribute__((weak_import));
+extern volatile u64 native_ufs_block_failures __attribute__((weak_import));
+extern volatile u64 native_ufs_read_ticks __attribute__((weak_import));
+extern volatile u64 native_ufs_verify_ticks __attribute__((weak_import));
+static void ufs_status(void) {
+  if (!&native_ufs_block_reads || !&native_ufs_read_ticks || !&native_ufs_verify_ticks) return;
+  static u64 last_reads, last_read, last_verify;
+  const u64 reads = native_ufs_block_reads, read = native_ufs_read_ticks, verify = native_ufs_verify_ticks;
+  if (reads == last_reads) return;
+  const u64 hz = ticks_per_second() ? ticks_per_second() : 1;
+  char text[160];
+  snprintf(text, sizeof text, "requests %lu (+%lu) transport %lu ms (+%lu) hash %lu ms (+%lu) failures %lu", reads, reads - last_reads,
+           read * 1000 / hz, (read - last_read) * 1000 / hz, verify * 1000 / hz, (verify - last_verify) * 1000 / hz,
+           &native_ufs_block_failures ? native_ufs_block_failures : 0);
+  last_reads = reads; last_read = read; last_verify = verify;
+  line("ufs: ", text);
+}
+
+// The lines a Metal client process other than the render server streams to the driver (NativeAdrenoPublish.cpp native_adreno_client_text;
+// the plugin's clientReport: its compile cost), each time one changes.
+struct native_adreno_client_text_view {char name[20]; char text[64];};
+extern struct native_adreno_client_text_view native_adreno_client_text[4] __attribute__((weak_import));
+static void client_text_status(void) {
+  if (!&native_adreno_client_text) return;
+  static char last[4][64];
+  for (unsigned i = 0; i < 4; ++i) {
+    const struct native_adreno_client_text_view *c = &native_adreno_client_text[i];
+    if (!c->name[0] || !strncmp(last[i], c->text, sizeof last[i])) continue;
+    strlcpy(last[i], c->text, sizeof last[i]);
+    char text[100];
+    snprintf(text, sizeof text, "%.19s %.63s", c->name, last[i]);
+    line("gpu client: ", text);
+  }
+}
+
 static void ddr_status(void) {
   static volatile u32 *stats, *offset_page;
   static u64 last[32];
@@ -1146,17 +1184,23 @@ int boot_progress_pulse_anchor(unsigned long base, u64 bytes, unsigned width, un
   return 0;
 }
 
+// The keys' pressed set (Buttons.c, NativeHidInput's report 2 bits: 2 volume up, 3 volume down).
+extern volatile u32 native_buttons_mask __attribute__((weak_import));
+#define SAVE_KEYS 0xcu
+#define SAVE_PASSES 30u   // 3 s
+
 static void writer(void *argument, int result) {
   (void)argument; (void)result;
   const u64 start = ticks(), limit = ticks_per_second() * restart_after;
   for (u32 pass = 1;; ++pass) {
     messages();
     panic_text(0);
-    if (pass % 100 == 0) {display_status(); cpu_status(); touch_status(); gpu_stack_status(); framebuffer_status(); process_status(0); ddr_status();}
+    if (pass % 100 == 0) {display_status(); cpu_status(); touch_status(); gpu_stack_status(); framebuffer_status(); process_status(0); ddr_status(); ufs_status();}
     if (pass == 2000) process_status(1);   // the UI's stacks 200 s after the zone was mapped
     // Two corner crops every 50 s: a round can end on a panic before the 200 s mark (2026-10-24's unaligned_store round did), and
     // the crops of a round that turned the pages are the ones worth reading.
     if (pass % 500 == 0) framebuffer_crops();
+    if (pass % 10 == 0) client_text_status();
     if (pass % 5 == 0) touch_strokes();
     buttons_status();
     battery_status();
@@ -1178,6 +1222,25 @@ static void writer(void *argument, int result) {
       snprintf(text, sizeof text, "%u s after the zone was mapped (pipa-restart-after)", restart_after);
       line("restart into fastboot: ", text);
       restart_into_fastboot();
+    }
+    // Volume up and volume down held together for 3 s: the log of a stuck UI saved by hand, with the UI's stacks, and the restart into
+    // fastboot (warm, so the zone survives). 2026-10-25: the tablet froze on the way home and the long power press that ended it was
+    // a hard reset, which clears this zone.
+    static u32 keys_held;
+    if (&native_buttons_mask && (native_buttons_mask & SAVE_KEYS) == SAVE_KEYS) {
+      if (++keys_held == SAVE_PASSES) {
+        line("restart into fastboot: ", "volume up and volume down held 3 s");
+        messages();
+        display_status();
+        gpu_stack_status();
+        gpu_status(1);
+        framebuffer_status();
+        process_status(1);
+        messages();
+        restart_into_fastboot();
+      }
+    } else {
+      keys_held = 0;
     }
     if (restart_crashes && ui_crashes >= restart_crashes) {
       messages();
