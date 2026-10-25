@@ -271,8 +271,10 @@ chip_id = "207"
 # XNU takes one contiguous range: DarwinBoot takes the first free run of the firmware's map that holds it. Android finds
 # 0xffc20000..0x27fffffff (6 GiB) free in the second bank, and the third bank (0x800000000, 8 GiB) has the firmware's own images
 # at its top (0x9ff...). 4 GiB (the iPad7,1's) landed at 0x10007c000 in the second bank. 7.75 GiB went to the third bank and the
-# kernel stopped after the blue entry bar (2026-10-24): a physical base at 32 GiB is not handled yet. 5.75 GiB still fits the
-# second bank. All 16 GB would need several ranges in XNU's pmap and VM start-up.
+# kernel stopped after the blue entry bar (2026-10-24). That stop was osfmk/arm64/start.s running out of bootstrap tables, not
+# the 32 GiB base: the native 4 KiB pool held 14 L2 pages, 5.75 GiB uses 12, and a 7.75 GiB window needs 18 (it would have
+# stopped at a 4 GiB base too). patches/xnu/zzzz-bootstrap-table-pool.patch raises the pool to 34 pages, so 7.75 GiB is the
+# next thing to try here; all 16 GB still needs several ranges in XNU's pmap and VM start-up (HANDOFF-pipa-memory.md).
 owned_memory_size = "0x170000000"
 root_match_volume_uuid = "04769D26-2CA0-4825-B443-E2E5F88300F2"   # the OS volume of the same IPSW
 # All eight cores, boot CPU first: 0..0x300 Kryo 585 Silver (Cortex-A55), 0x400..0x600 Gold and 0x700 Gold Prime (Cortex-A77),
