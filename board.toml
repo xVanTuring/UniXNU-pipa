@@ -38,39 +38,40 @@ windows = [
 
 [kernel]
 defconfig = "pipa_defconfig"
-# Archive builders of the kernel step, in order; the ones pipa_defconfig links. build-arm-driver.py is the generic
-# driver builder of UniXNU-sheng.
+# Archive builders of the kernel step, in order; the ones pipa_defconfig links. build-arm-driver.py is UniXNU's generic
+# driver builder, which finds each component in UniXNU's components.toml.
 archives = [
   "build-corecrypto-14.py",
   "build-corecrypto-14.py --namespace",
   "build-arm-driver.py ArmDTPlatform",
   "build-arm-driver.py ArmCpu",
-  "build-arm-driver.py NativeAES",
-  # drivers/NativeUfs (the pipa branch): the SM8250 host with the verified block device and root publication.
-  "build-arm-driver.py NativeUfs --sm8250",
-  "build-arm-driver.py NativeVirtioBlock --verified-root",
-  "build-native-virtio-bindings.py --component NativeVirtioBlock --directory build/native-virtio-block-verified",
-  "build-arm-driver.py NativeRamBlock",
-  "build-native-virtio-bindings.py --component NativeRamBlock --directory build/native-ram-block",
-  "build-native-aes-bindings.py",
+  "build-arm-driver.py SoftwareAES",
+  # drivers/PipaUfs: the SM8250 host with the verified block device and root publication.
+  "build-arm-driver.py PipaUfs --sm8250",
+  "build-arm-driver.py VirtioMmioBlock --verified-root",
+  "build-virtio-mmio-bindings.py --component VirtioMmioBlock --directory build/virtio-mmio-block-verified",
+  "build-arm-driver.py RamBlock",
+  "build-virtio-mmio-bindings.py --component RamBlock --directory build/ram-block",
+  "build-software-aes-bindings.py",
   "build-libpthread-kernel.py",
   "build-link-stubs.py",
   "build-platform-power.py",
   # The 395-byte owner root anchor and the XNU crypto adapter, the same pinned key as UniXNU-tb128fu; the signed envelopes are
   # in userdata (UniXNU-tb128fu's userdata-root image).
   "build-verified-root-key.py --pin 70a5ea346d2d779a7ef43eb4ed8b17f54488e160d8c2a6d6420969664e3ae798",
-  # NativeAdreno for the Adreno 650 with the GMU's SMMU context, the HFI kit and the A650 cold start (CONFIG_XNU_NATIVE_ADRENO).
-  "build-native-adreno-a650.py",
+  # Adreno650 (NativeAdreno for the Adreno 650) with the GMU's SMMU context, the HFI kit and the A650 cold start
+  # (CONFIG_XNU_NATIVE_ADRENO).
+  "build-adreno650.py",
   # The staged accelerator class added to the same archive (GpuProbe.cpp mode 12), as on UniXNU-tb128fu.
-  "build-native-adreno-accelerator.py",
+  "build-adreno740-accelerator.py --component Adreno650",
   # The display, key store stand-in and HID input (CONFIG_XNU_NATIVE_LEGACY_DISPLAY); it reads the previous kernel step's
   # kernel.macho and UniXNU-qemu's display reference (see its header).
-  "build-native-legacy-display.py",
+  "build-gop-legacy-display.py",
 ]
 
 # The same original kernelcache and prelink selection as UniXNU-sheng: the target image is the same.
 [kernel.prelink]
-tool = "kits/NativePrelink/emit_prelink.py"
+tool = "kits/XnuPrelink/emit_prelink.py"
 kernel = "build/xnu/ios-obj/DEVELOPMENT_ARM64_BCM2837/mach.development.bcm2837.unstripped.noctf"
 kernelcache_sha256 = "f18b4df865405f2a287b84977d7aca745e056d656d9fc9df1662970ce2969de7"
 slide = "-0x1000000"
@@ -215,7 +216,7 @@ kernel_args = [
   "offline-hid-input=1",
   "offline-hid-home=1",
   "sheng-touch-hid=1",
-  # A fixed 60 Hz for the render server (drivers/NativeMobileDisplay): a work-loop tick stands in for the GOP scanout's missing
+  # A fixed 60 Hz for the render server (drivers/GopFramebuffer): a work-loop tick stands in for the GOP scanout's missing
   # vblank; with the generic 24 to 60 Hz range UniXNU-tb128fu's render server settled at 24 Hz.
   "sheng-vsync=60",
   "sheng-vsync-fixed=1",
@@ -262,7 +263,7 @@ kernel_args = [
   # volume and mounted before launchd starts; the name is UniXNU-sheng's.
   "sheng-gpu-addon=1",
   # The GPU hand-off: the Metal plugin copies each finished frame into the firmware frame buffer with the GPU. A refused offer or a
-  # failed copy falls back to the CPU copy (drivers/NativeMobileDisplay NativeLegacyDisplay.cpp).
+  # failed copy falls back to the CPU copy (drivers/GopFramebuffer NativeLegacyDisplay.cpp).
   "sheng-fb-gpu=1",
 ]
 

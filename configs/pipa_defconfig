@@ -1,5 +1,5 @@
 # Kernel configuration of pipa: the generic CPU, interrupt, timer and platform expert path, the source corecrypto and
-# pthread providers, NativeAES, the SM8250 UFS root and the owner root chain of UniXNU-tb128fu. CONFIG_XNU_<NAME> becomes
+# pthread providers, SoftwareAES, the SM8250 UFS root and the owner root chain of UniXNU-tb128fu. CONFIG_XNU_<NAME> becomes
 # XNU_<NAME> for the kernel build.
 #
 # The display stack of UniXNU-tb128fu without its GPU: NATIVE_LEGACY_DISPLAY (the firmware frame buffer, QuartzCore's CPU
@@ -19,15 +19,16 @@ CONFIG_XNU_DT_PANIC_REGION=y
 CONFIG_XNU_NATIVE_ARCH_TIMER=y
 CONFIG_XNU_NATIVE_PAN=y
 CONFIG_XNU_SHENG_PMGR=y
-# NativeUfs of drivers/NativeUfs (pipa branch, SM8250 constants) with the VerifiedRoot owner policy, as on UniXNU-tb128fu: the
+# NativeUfs of drivers/PipaUfs (SM8250 constants) with the VerifiedRoot owner policy, as on UniXNU-tb128fu: the
 # kernel carries only the 395-byte owner key (build/verified-root-key); the signed OS/SystemOS envelopes are in the userdata
 # policy directory (SHNGPOL1) and are read at run time. userdata holds UniXNU-tb128fu's image (the same IPSW and owner key;
 # the image does not depend on the board).
 CONFIG_XNU_NATIVE_UFS=y
+CONFIG_XNU_NATIVE_UFS_ARCHIVE="{tree}/build/pipa-ufs/libPipaUfs.a"
 # Verified variant: its root authorization query is what the owner chain below calls. No virtio device exists on this
 # board, so its own block transport never configures.
 CONFIG_XNU_NATIVE_VIRTIO_BLOCK=y
-CONFIG_XNU_NATIVE_VIRTIO_BLOCK_ARCHIVE="{tree}/build/native-virtio-block-verified/libNativeVirtioBlock.a"
+CONFIG_XNU_NATIVE_VIRTIO_BLOCK_ARCHIVE="{tree}/build/virtio-mmio-block-verified/libVirtioMmioBlock.a"
 # The Data seed: a packed APFS scratch volume published as a RAM block device.
 CONFIG_XNU_NATIVE_RAM_BLOCK=y
 # Owner root chain, the same ladder as UniXNU-tb128fu and UniXNU-sheng: audit/trust the verified root, mount the SystemOS
@@ -55,10 +56,11 @@ CONFIG_XNU_BUILD_ARCHIVES=y
 # No-op hooks for probes of the left-out components (scripts/build-link-stubs.py).
 CONFIG_XNU_EXTRA_LD_ARCHIVES="{tree}/build/link-stubs/libLinkStubs.a"
 CONFIG_XNU_NATIVE_MOBILE_DISPLAY=n
-# The display, key store stand-in and HID input (scripts/build-native-legacy-display.py, drivers/NativeMobileDisplay of the
+# The display, key store stand-in and HID input (scripts/build-gop-legacy-display.py, drivers/GopFramebuffer of the
 # pipa branch): IOMobileGraphicsFamily loaded from bsd_init, NativeLegacyDisplay on the firmware frame buffer.
 CONFIG_XNU_NATIVE_LEGACY_DISPLAY=y
-# NativeAdreno for the Adreno 650 (scripts/build-native-adreno-a650.py: the a6xx GPU half, the GMU's SMMU context, the HFI kit
+# Adreno650, NativeAdreno for the Adreno 650 (scripts/build-adreno650.py: the a6xx GPU half, the GMU's SMMU context, the HFI kit
 # and package/A650Gmu.c); no personality, the board's GPU probe (package/GpuProbe.cpp) drives it.
 CONFIG_XNU_NATIVE_ADRENO=y
+CONFIG_XNU_NATIVE_ADRENO_ARCHIVE="{tree}/build/adreno650/libAdreno650.a"
 CONFIG_XNU_ARMVIRT_PLATFORM=n

@@ -65,7 +65,7 @@ boolean_t ml_get_interrupts_enabled(void);
 boolean_t ml_at_interrupt_context(void);
 int get_preemption_level(void);
 IOReturn armcpu_spi_attach(uint32_t intid, bool edge, void (*handler)(void *), void *context, uint32_t *readback, uint64_t *router);
-// The staged AGXAccelerator (drivers/NativeAdreno/NativeAdrenoAccelerator.cpp, build-native-adreno-accelerator.py): its static
+// The staged AGXAccelerator (drivers/Adreno650/NativeAdrenoAccelerator.cpp, build-adreno740-accelerator.py --component Adreno650): its static
 // initializer runs only after the original IOGPUFamily kext has loaded, because the parent metaclass does not exist before that.
 void native_adreno_accelerator_static_init(void) __asm__("__GLOBAL__sub_I_NativeAdrenoAccelerator.cpp");
 IOService *native_adreno_accelerator_allocate(void);
@@ -634,7 +634,7 @@ void hwInit() {
     gw64(0xE09, 0x0001fffffffff000ull);                                 // UCHE_TRAP_BASE
     gw64(0xE07, 0x0001fffffffff000ull);                                 // UCHE_WRITE_THRU_BASE
     // UCHE_GMEM_RANGE_MIN/MAX are left alone, as Linux does on the a650 family (GMEM base 0, kDeviceInfo); NativeAdreno's kernel
-    // buffers now lie at 32 MiB and up, outside that window (drivers/NativeAdreno NativeAdrenoGpuContext.h). With the window
+    // buffers now lie at 32 MiB and up, outside that window (drivers/Adreno650 NativeAdrenoGpuContext.h). With the window
     // moved to 16 MiB instead (as on UniXNU-sheng and UniXNU-tb128fu) every shader access still ended in UCHE_OOB_ACCESS
     // (2026-10-24: Turnip's check filled a buffer but its compute shader wrote nothing and its triangle drew nothing).
     if (gUcheGmem16M) {gw64(0xE0B, 0x1000000); gw64(0xE0D, 0x1000000 + 0x120000 - 1);}

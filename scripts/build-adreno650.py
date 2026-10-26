@@ -1,19 +1,20 @@
 #!/usr/bin/env python3
-"""NativeAdreno for pipa's Adreno 650 (a6xx with a GMU): build/native-adreno/libNativeAdreno.a, the archive that
-CONFIG_XNU_NATIVE_ADRENO links. After UniXNU-tb128fu's build-native-adreno-a6xx.py (the Adreno 610 half: GPU context, ring,
-submission, timer, user client and publication objects with the SMMU and PM4 kits, drivers/NativeAdreno branch pipa off its
-tb128fu branch), plus what the A650's GMU needs: the GMU's SMMU context and memory (NativeAdrenoGmuContext/Memory), the HFI
-kit (kits/AdrenoFirmware) and the A650 cold start (package/A650Gmu.c). NativeAdrenoService.cpp (sheng's A740 service) stays
-out; the board probe (package/GpuProbe.cpp, pipa-gpu=<mode>) drives these objects. No firmware is embedded here: the GMU,
-SQE and zap images are the board probe's (build-native-legacy-display.py)."""
+"""Adreno650 (drivers/Adreno650, NativeAdreno for pipa's Adreno 650: a6xx with a GMU): build/adreno650/libAdreno650.a, the
+archive that CONFIG_XNU_NATIVE_ADRENO links (CONFIG_XNU_NATIVE_ADRENO_ARCHIVE). After UniXNU-tb128fu's build-native-adreno-a6xx.py
+(the Adreno 610 half: GPU context, ring, submission, timer, user client and publication objects with the SMMU and PM4 kits;
+Adreno650 began as the pipa branch of the NativeAdreno fork, off its tb128fu branch), plus what the A650's GMU needs: the GMU's
+SMMU context and memory (NativeAdrenoGmuContext/Memory), the HFI kit (kits/AdrenoFirmware) and the A650 cold start
+(package/A650Gmu.c). NativeAdrenoService.cpp (sheng's A740 service) stays out; the board probe (package/GpuProbe.cpp,
+pipa-gpu=<mode>) drives these objects. No firmware is embedded here: the GMU, SQE and zap images are the board probe's
+(build-gop-legacy-display.py)."""
 import json, re, subprocess, sys
 from pathlib import Path
 ROOT = Path(__file__).resolve().parents[1]
 c_recipe = json.loads((ROOT / 'build/xnu/ios-obj/DEVELOPMENT_ARM64_BCM2837/bsd/DEVELOPMENT/bsd_init.o.json').read_text().strip().rstrip(','))
 cxx_recipe = json.loads((ROOT / 'build/xnu/ios-obj/DEVELOPMENT_ARM64_BCM2837/iokit/DEVELOPMENT/IOPlatformExpert.cpo.json').read_text().strip().rstrip(','))
-out = ROOT / 'build/native-adreno'
+out = ROOT / 'build/adreno650'
 out.mkdir(parents=True, exist_ok=True)
-driver = ROOT / 'drivers/NativeAdreno'
+driver = ROOT / 'drivers/Adreno650'
 sources = sorted((ROOT / 'kits/ArmSmmu4K').glob('ArmSmmu4K*.c')) + [ROOT / 'kits/AdrenoPM4/AdrenoPM4.c']
 # The HFI kit and the A650 cold start that uses it.
 sources += [ROOT / 'kits/AdrenoFirmware' / (name + '.c') for name in ('AdrenoFirmware', 'AdrenoHfi', 'AdrenoHfiStartup', 'AdrenoHfiVotes')]
@@ -54,7 +55,7 @@ for source in sources:
     if result.returncode:
         sys.exit(str(source) + ':\n' + result.stderr[-2500:])
     objects.append(obj)
-archive = out / 'libNativeAdreno.a'
+archive = out / 'libAdreno650.a'
 archive.unlink(missing_ok=True)
 subprocess.run(['xcrun', 'ar', 'rcs', archive, *objects], check=True)
 # Every NativeAdreno or kit symbol the objects use must be defined by them; the rest is the kernel's.

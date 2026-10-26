@@ -4,7 +4,7 @@
 //   1  read-only snapshot of the GCC branches, the S4 DFS levels and the touch pins
 //   2  vote the QUP clocks, wait for them, configure the pins, read the GENI engine identity
 //   3  GENI SPI init (FIFO mode, or SE DMA through an SMMU pass-through if the FIFO is disabled) and clock, an engine loopback test,
-//      then reset the touch bootloader and read the chip id (drivers/NativeNovatekTouch nvt_identify)
+//      then reset the touch bootloader and read the chip id (drivers/PipaNovatekTouch nvt_identify)
 //   4  host-download the firmware (the tablet's novatek_nt36532_m82_fw_tm.bin, built in by build-native-legacy-display.py), wait
 //      for the reset state and read the firmware info (the coordinate range)
 //   5  read point reports when the attention line (GPIO39, rising edge, latched by the TLMM without an interrupt) fires, and

@@ -1,5 +1,5 @@
 // SPDX-License-Identifier: BSD-2-Clause-Patent
-// pipa's power and volume keys for the HID input (drivers/NativeHidInput: native_buttons_set_sink, report 2), `pipa-buttons=1`.
+// pipa's power and volume keys for the HID input (drivers/ShengHidInput: native_buttons_set_sink, report 2), `pipa-buttons=1`.
 // A kernel thread reads the PM8150 PON's and GPIO6's RT_STS registers through the SPMI arbiter's observer channels every 10 ms
 // (reads only; nothing in the PMIC is configured), debounces over two reads and passes every change of the pressed set to the
 // sink. The keys and registers are in ButtonsCore.h. The arbiter is the one BootRamoops.c already uses for the restart (version

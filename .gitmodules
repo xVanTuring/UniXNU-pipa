@@ -1,28 +1,31 @@
 [submodule "drivers/NativeUfs"]
-	path = drivers/NativeUfs
-	url = https://github.com/xVanTuring/NativeUfs.git
+	path = drivers/PipaUfs
+	url = https://github.com/xVanTuring/PipaUfs.git
 	branch = pipa
 [submodule "drivers/NativeMobileDisplay"]
-	path = drivers/NativeMobileDisplay
-	url = https://github.com/xVanTuring/NativeMobileDisplay.git
+	path = drivers/GopFramebuffer
+	url = https://github.com/xVanTuring/GopFramebuffer.git
 	branch = pipa
 [submodule "drivers/ArmCpu"]
 	path = drivers/ArmCpu
 	url = https://github.com/xVanTuring/ArmCpu.git
 	branch = pipa
 [submodule "drivers/NativeNovatekTouch"]
-	path = drivers/NativeNovatekTouch
-	url = https://github.com/xVanTuring/NativeNovatekTouch.git
+	path = drivers/PipaNovatekTouch
+	url = https://github.com/xVanTuring/PipaNovatekTouch.git
 	branch = pipa
 [submodule "drivers/NativeAdreno"]
-	path = drivers/NativeAdreno
-	url = https://github.com/xVanTuring/NativeAdreno.git
+	path = drivers/Adreno650
+	url = https://github.com/xVanTuring/Adreno650.git
 	branch = pipa
 [submodule "kits/ArmSmmu4K"]
 	path = kits/ArmSmmu4K
 	url = https://github.com/xVanTuring/ArmSmmu4K.git
 	branch = pipa
 [submodule "drivers/NativeMetal"]
-	path = drivers/NativeMetal
-	url = https://github.com/xVanTuring/NativeMetal.git
+	path = drivers/AdrenoMetal
+	url = https://github.com/xVanTuring/AdrenoMetal.git
 	branch = pipa
+[submodule "drivers/ShengHidInput"]
+	path = drivers/ShengHidInput
+	url = https://github.com/UniXNU/ShengHidInput.git

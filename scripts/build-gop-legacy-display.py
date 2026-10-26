@@ -9,7 +9,7 @@ and NativeHidInput, and TouchState.cpp (the finger set; nothing writes it until 
 Metal device: QuartzCore's original CPU renderer draws, and the display copies its frames to the firmware frame buffer.
 The original-class checks and bindings are unchanged. Their inputs, the reference candidate and the observation of the
 original class, are UniXNU-qemu's (its build-display-abi.py observes the class under QEMU, which this board's kernel
-cannot boot in): see the check below that makes them hold for this board's kernel. UniXNU's build-native-hid-input.py gets
+cannot boot in): see the check below that makes them hold for this board's kernel. UniXNU's build-sheng-hid-input.py gets
 the kernel step's kernel as its reference candidate, which carries the same original IOHIDFamily as every kernel of this
 IPSW.
 """
@@ -20,7 +20,7 @@ import struct
 import subprocess
 import sys
 ROOT=Path(__file__).resolve().parents[1];OUT=ROOT/'build/native-legacy-display';OUT.mkdir(parents=True,exist_ok=True)
-sys.path.insert(0,str(ROOT/'kits/NativePrelink'))
+sys.path.insert(0,str(ROOT/'kits/XnuPrelink'))
 from native_prelink import macho,backed_offset,exports
 def run(cmd,**kw):return subprocess.check_output([str(x) for x in cmd],timeout=90,**kw)
 def require(v,why):
@@ -33,7 +33,10 @@ def sha(p):return hashlib.sha256(Path(p).read_bytes()).hexdigest()
 import os,shutil
 FAMILY='com.apple.iokit.IOMobileGraphicsFamily'
 reference_tree=Path(os.environ.get('PIPA_DISPLAY_REFERENCE') or ROOT.parents[1]/'qemu/tree')
-reference_candidate=reference_tree/'build/native-prelink/native-owner-mobile-graphics-candidate.macho'
+# A reference tree built before UniXNU renamed NativePrelink to XnuPrelink keeps its candidates under build/native-prelink.
+reference_candidate=next((reference_tree/d/'native-owner-mobile-graphics-candidate.macho' for d in ('build/xnu-prelink','build/native-prelink')
+                          if (reference_tree/d/'native-owner-mobile-graphics-candidate.macho').exists()),
+                         reference_tree/'build/xnu-prelink/native-owner-mobile-graphics-candidate.macho')
 reference_observation=reference_tree/'build/darwinboot-owner-hvf-mobile-graphics-legacy-class/gdb-stop.json'
 board_kernel=ROOT.parent/'kernel/kernel.macho'
 require(reference_candidate.exists() and reference_observation.exists() and board_kernel.exists(),
@@ -72,7 +75,7 @@ for segment,va,size in extents:
         x,y=struct.unpack_from('<Q',a,at)[0],struct.unpack_from('<Q',b,at)[0]
         require(reference_names.get(x) and reference_names.get(x)==board_names.get(y),
                 f'{va+at:#x}: the original display family binds another kernel symbol in this kernel')
-staged=ROOT/'build/native-prelink/native-owner-mobile-graphics-candidate.macho';staged.parent.mkdir(parents=True,exist_ok=True)
+staged=ROOT/'build/xnu-prelink/native-owner-mobile-graphics-candidate.macho';staged.parent.mkdir(parents=True,exist_ok=True)
 shutil.copyfile(reference_candidate,staged);shutil.copyfile(reference_candidate.with_suffix('.json'),staged.with_suffix('.json'))
 observed=ROOT/'build/darwinboot-owner-hvf-mobile-graphics-legacy-class/gdb-stop.json';observed.parent.mkdir(parents=True,exist_ok=True)
 shutil.copyfile(reference_observation,observed)
@@ -168,9 +171,9 @@ for segment in image['segments']:
                 if bits>>27&1 and bits>>28==0 and bits>>25&3==3:relocations[sec['va']+offset]=symbols[bits&0xffffff][0]
 compiled=[relocations.get(vtable+16+i*8) for i in range(358)]
 require(all(compiled) and vtable+16+358*8 not in relocations,'Exact owned 358-entry vtable')
-candidate=ROOT/'build/native-prelink/native-owner-mobile-graphics-candidate.macho'
+candidate=ROOT/'build/xnu-prelink/native-owner-mobile-graphics-candidate.macho'
 if not candidate.exists():  # pruned: same fallback as scripts/audit-mobile-graphics-legacy.py (identical original family executable)
-    later=sorted((ROOT/'build/native-prelink').glob('native-owner-ufs-cpu-desktop-*-candidate.macho'),key=lambda f:f.stat().st_mtime)
+    later=sorted((ROOT/'build/xnu-prelink').glob('native-owner-ufs-cpu-desktop-*-candidate.macho'),key=lambda f:f.stat().st_mtime)
     require(later,'No reference candidate available');candidate=later[-1]
 old=candidate.read_bytes();old_image=macho(old)
 names={n:v for v,group in exports(old,old_image).items() for n in group}
@@ -277,20 +280,20 @@ touch_source=ROOT/'kits/pipa/TouchState.cpp'
 touch_obj=OUT/'TouchState.o'
 run([str(touch_source) if str(arg)==str(source) else str(touch_obj) if str(arg)==str(OUT/'LegacyDisplayProbe.o') else arg for arg in cmd],cwd=r['directory'])
 # The touch controller (TouchProbe.cpp, pipa-touch=<stage>): the board probe with the kernel's C++ flags; the generic GENI SPI
-# library, the Novatek protocol (drivers/NativeNovatekTouch, pipa branch) and the firmware object with the kernel's C flags. The
+# library, the Novatek protocol (drivers/PipaNovatekTouch, pipa branch) and the firmware object with the kernel's C flags. The
 # firmware is novatek_nt36532_m82_fw_tm.bin of the tablet's stock kernel (its built-in firmware table; the panel is the "36" one,
 # whose maker 0x36 the DT pairs with the _tm image), kept outside Git in the board's .cache/firmware/touch (PIPA_TOUCH_FIRMWARE
 # overrides it).
 touch_dir=OUT/'touch';touch_dir.mkdir(exist_ok=True)
-touch_includes=['-I',str(ROOT/'kits/pipa'),'-I',str(ROOT/'drivers/NativeGeniSpi'),'-I',str(ROOT/'drivers/NativeNovatekTouch')]
+touch_includes=['-I',str(ROOT/'kits/pipa'),'-I',str(ROOT/'drivers/QcomGeniSpi'),'-I',str(ROOT/'drivers/PipaNovatekTouch')]
 probe_source=ROOT/'kits/pipa/TouchProbe.cpp';probe_obj=touch_dir/'TouchProbe.o'
 run([str(probe_source) if str(arg)==str(source) else str(probe_obj) if str(arg)==str(OUT/'LegacyDisplayProbe.o') else arg for arg in cmd]+touch_includes,
     cwd=r['directory'])
 # The GPU bring-up (GpuProbe.cpp, pipa-gpu=<mode>) the same way, with NativeAdreno's and its kits' headers (the objects are
-# in libNativeAdreno.a, scripts/build-native-adreno-a650.py), and the GMU firmware: a650_gmu.bin of the tablet's vendor
+# in libAdreno650.a, scripts/build-adreno650.py), and the GMU firmware: a650_gmu.bin of the tablet's vendor
 # partition (/firmware), kept outside Git in .cache/firmware/gpu (PIPA_GMU_FIRMWARE overrides it).
 gpu_source=ROOT/'kits/pipa/GpuProbe.cpp';gpu_obj=touch_dir/'GpuProbe.o'
-gpu_includes=['-I',str(ROOT/'drivers/NativeAdreno'),'-I',str(ROOT/'kits/ArmSmmu4K'),'-I',str(ROOT/'kits/AdrenoFirmware'),
+gpu_includes=['-I',str(ROOT/'drivers/Adreno650'),'-I',str(ROOT/'kits/ArmSmmu4K'),'-I',str(ROOT/'kits/AdrenoFirmware'),
               '-I',str(ROOT/'kits/AdrenoPM4')]
 run([str(gpu_source) if str(arg)==str(source) else str(gpu_obj) if str(arg)==str(OUT/'LegacyDisplayProbe.o') else arg for arg in cmd]+
     touch_includes+gpu_includes,cwd=r['directory'])
@@ -366,7 +369,7 @@ def c_compile(c_source,c_obj):
 touch_objs=[probe_obj,gpu_obj,mdss_obj,flip_obj]
 # Buttons.c (pipa-buttons=1, the power and volume keys over SPMI for the HID input) and Gestures.c (pipa-gesture=<seconds>, the
 # scripted touches into the finger set the HID input reports) go the same way.
-for c_source in (ROOT/'drivers/NativeGeniSpi/GeniSpi.c',ROOT/'drivers/NativeNovatekTouch/NvtProtocol.c',firmware_c,ROOT/'kits/pipa/Buttons.c',
+for c_source in (ROOT/'drivers/QcomGeniSpi/GeniSpi.c',ROOT/'drivers/PipaNovatekTouch/NvtProtocol.c',firmware_c,ROOT/'kits/pipa/Buttons.c',
                  ROOT/'kits/pipa/Gestures.c',gmu_c,sqe_c,zap_c):
     c_obj=touch_dir/(c_source.stem+'.o');c_compile(c_source,c_obj);touch_objs.append(c_obj)
 # The display backend, its probe, the key store, the HID input and the touch controller: UniXNU-tb128fu's Himax touch, GPU, RPM and
@@ -374,13 +377,13 @@ for c_source in (ROOT/'drivers/NativeGeniSpi/GeniSpi.c',ROOT/'drivers/NativeNova
 # accelerator stay out (they drive other hardware).
 archive=OUT/'libNativeLegacyDisplay.late.a';archive.unlink(missing_ok=True)
 kernel=ROOT.parent/'kernel/kernel.macho'
-reference=ROOT/'build/native-prelink/native-owner-ufs-cpu-desktop-pipa-candidate.macho'
+reference=ROOT/'build/xnu-prelink/native-owner-ufs-cpu-desktop-pipa-candidate.macho'
 reference.parent.mkdir(parents=True,exist_ok=True)
 reference.write_bytes(kernel.read_bytes());reference.with_suffix('.json').write_bytes(kernel.with_suffix('.json').read_bytes())
-print(run(['python3',ROOT/'scripts/build-native-hid-input.py'],text=True),end='')
-hid_dir=ROOT/'build/native-hid-input'
-print(run(['python3',ROOT/'scripts/build-arm-driver.py','NativeKeyStoreEvents'],text=True),end='')
-keyevents=ROOT/'build/native-keystore-events'
+print(run(['python3',ROOT/'scripts/build-sheng-hid-input.py'],text=True),end='')
+hid_dir=ROOT/'build/sheng-hid-input'
+print(run(['python3',ROOT/'scripts/build-arm-driver.py','AppleKeyStoreState'],text=True),end='')
+keyevents=ROOT/'build/apple-key-store-state'
 keyevents_late=keyevents/'NativeKeyStoreEvents.late.o'
 run([llvm/'llvm-objcopy','--remove-section=__DATA,__mod_init_func',
      '--globalize-symbol=__GLOBAL__sub_I_NativeKeyStoreEvents.cpp',
@@ -389,12 +392,12 @@ require(code((keyevents/'NativeKeyStoreEvents.o').read_bytes(),macho((keyevents/
         code(keyevents_late.read_bytes(),macho(keyevents_late.read_bytes())),'Owned event-service instructions unchanged by late init staging')
 run(['xcrun','ar','rcs',archive,late,OUT/'original-bindings.o',OUT/'LegacyDisplayProbe.o',keystore_obj,keyevents_late,
      hid_obj,touch_obj,hid_dir/'NativeHidInput.late.o',hid_dir/'hid-original-bindings.o',battery_late,*touch_objs])
-sources=[ROOT/'drivers/NativeMobileDisplay/NativeLegacyDisplay.cpp',ROOT/'drivers/NativeMobileDisplay/NativeLegacyRequest.h',source,
-         keystore_source,ROOT/'drivers/NativeKeyStoreEvents/NativeKeyStoreEvents.cpp',hid_source,touch_source,
-         ROOT/'drivers/NativeHidInput/NativeHidInput.cpp',ROOT/'scripts/build-native-hid-input.py',probe_source,
-         ROOT/'kits/pipa/TouchBoard.h',ROOT/'kits/pipa/SmmuBypass.h',ROOT/'drivers/NativeGeniSpi/GeniSpi.c',
-         ROOT/'drivers/NativeGeniSpi/GeniSpi.h',ROOT/'drivers/NativeNovatekTouch/NvtProtocol.c',
-         ROOT/'drivers/NativeNovatekTouch/NvtProtocol.h',firmware,ROOT/'kits/pipa/Buttons.c',ROOT/'kits/pipa/ButtonsCore.h',
+sources=[ROOT/'drivers/GopFramebuffer/NativeLegacyDisplay.cpp',ROOT/'drivers/GopFramebuffer/NativeLegacyRequest.h',source,
+         keystore_source,ROOT/'drivers/AppleKeyStoreState/NativeKeyStoreEvents.cpp',hid_source,touch_source,
+         ROOT/'drivers/ShengHidInput/NativeHidInput.cpp',ROOT/'scripts/build-sheng-hid-input.py',probe_source,
+         ROOT/'kits/pipa/TouchBoard.h',ROOT/'kits/pipa/SmmuBypass.h',ROOT/'drivers/QcomGeniSpi/GeniSpi.c',
+         ROOT/'drivers/QcomGeniSpi/GeniSpi.h',ROOT/'drivers/PipaNovatekTouch/NvtProtocol.c',
+         ROOT/'drivers/PipaNovatekTouch/NvtProtocol.h',firmware,ROOT/'kits/pipa/Buttons.c',ROOT/'kits/pipa/ButtonsCore.h',
          ROOT/'kits/pipa/Gestures.c',ROOT/'kits/pipa/GesturesCore.h',
          battery_source,ROOT/'kits/pipa/NativeBatteryBoard.h',
          gpu_source,ROOT/'kits/pipa/GpuPowerBoard.h',ROOT/'kits/pipa/A650Gmu.h',gmu_firmware,sqe_firmware,zap_firmware,
@@ -406,7 +409,7 @@ run([llvm/'llvm-objcopy','--remove-section=__DATA,__mod_init_func','--globalize-
 require(code((gop/'NativeGOPPresenter.o').read_bytes(),macho((gop/'NativeGOPPresenter.o').read_bytes()))==
         code(gop_late.read_bytes(),macho(gop_late.read_bytes())),'Owned presenter instructions unchanged by late init staging')
 run(['xcrun','ar','rcs',archive,gop_late])
-sources.extend([ROOT/'drivers/NativeMobileDisplay/NativeGOPPresenter.cpp',ROOT/'drivers/NativeMobileDisplay/NativeGOPWire.h'])
+sources.extend([ROOT/'drivers/GopFramebuffer/NativeGOPPresenter.cpp',ROOT/'drivers/GopFramebuffer/NativeGOPWire.h'])
 (OUT/'build-report.json').write_text(json.dumps(dict(
     source_sha256={str(p.relative_to(ROOT)):sha(p) for p in sources},generated_abi_sha256=sha(OUT/'OriginalLegacyFramebufferABI.h'),
     original_candidate_sha256=sha(candidate),original_audit_sha256=sha(ROOT/'build/display-analysis/mobile-graphics-legacy-abi.json'),
