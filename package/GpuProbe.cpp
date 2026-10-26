@@ -498,7 +498,8 @@ int naIdle(void *) {
     return 0;
 }
 void naProgress(uint32_t step) {native_gpu_step = 110 + step;}
-NativeAdrenoRingIo gRio{nullptr, naWrite, naRead, naBarrier};
+// No AHB fence status: the A650's GMU runs without IFPC here, so the GPU domain stays up and a WPTR write is not dropped.
+NativeAdrenoRingIo gRio{nullptr, naWrite, naRead, naBarrier, nullptr, nullptr};
 NativeAdrenoRingCache gCache{nullptr, naPublish, naAcquire};
 NativeAdrenoRingClock gClock{nullptr, naNow, naIdle};
 void gw(uint32_t dword, uint32_t value) {naWrite(nullptr, dword, value);}
